@@ -3,9 +3,9 @@ mod db;
 
 use db::DB;
 use dotenv::dotenv;
-use std::fmt::format;
 
 const PROJECT_ID: &str = "redisnode";
+const MAX_NUM_BLOCKS: Option<usize> = Some(1000000);
 
 fn main() {
     openssl_probe::init_ssl_cert_env_vars();
@@ -51,24 +51,25 @@ async fn listen_blocks(
     mut db: DB,
 ) {
     while let Some(streamer_message) = stream.recv().await {
-        let mut data = vec![(
+        let data = vec![(
             "block".to_string(),
-            serde_json::to_string(&streamer_message.block).unwrap(),
+            serde_json::to_string(&streamer_message).unwrap(),
         )];
-        for shard in &streamer_message.shards {
-            data.push((
-                format!("shard-{}", shard.shard_id),
-                serde_json::to_string(shard).unwrap(),
-            ));
-        }
 
         // TODO: Retry
-        db.xadd(
-            "blocks",
-            format!("{}-*", streamer_message.block.header.height).as_str(),
-            &data,
-        )
-        .await
-        .expect("Failed to xadd data to redis");
+        let id = format!("{}-0", streamer_message.block.header.height);
+        let result = db.xadd("blocks", &id, &data, MAX_NUM_BLOCKS).await;
+        match result {
+            Ok(res) => {
+                tracing::log::debug!(target: PROJECT_ID, "Added {}", res);
+            }
+            Err(res) => {
+                if res.kind() == redis::ErrorKind::ResponseError {
+                    tracing::log::debug!(target: PROJECT_ID, "Duplicate ID");
+                } else {
+                    panic!("Error: {}", res);
+                }
+            }
+        }
     }
 }

@@ -38,8 +38,10 @@ serde_repr = "0.1.6"
 
 near-indexer = { git = "https://github.com/near/nearcore", rev = "1.36.5" }
 
+itertools = "0.12.0"
+
 ### Redis
-redis = { version = "0.24.0", features = ["tokio-comp", "tokio-native-tls-comp"] }
+redis = { version = "0.24.0", features = ["tokio-comp", "tokio-native-tls-comp", "streams"] }
 
 ### Locking versions for 1.69.0
 clap = "=4.2.4"

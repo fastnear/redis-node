@@ -1,3 +1,8 @@
+mod stream;
+
+use stream::*;
+
+use itertools::Itertools;
 use redis::aio::Connection;
 use redis::Client;
 use std::env;
@@ -19,6 +24,7 @@ impl DB {
     }
 }
 
+#[allow(dead_code)]
 impl DB {
     pub async fn set(&mut self, key: &str, value: &str) -> redis::RedisResult<String> {
         redis::cmd("SET")
@@ -40,12 +46,59 @@ impl DB {
         key: &str,
         id: &str,
         data: &[(String, String)],
+        max_len: Option<usize>,
     ) -> redis::RedisResult<String> {
-        redis::cmd("XADD")
+        if let Some(max_len) = max_len {
+            redis::cmd("XADD")
+                .arg(key)
+                .arg("MAXLEN")
+                .arg("~")
+                .arg(max_len)
+                .arg(id)
+                .arg(data)
+                .query_async(&mut self.connection)
+                .await
+        } else {
+            redis::cmd("XADD")
+                .arg(key)
+                .arg(id)
+                .arg(data)
+                .query_async(&mut self.connection)
+                .await
+        }
+    }
+
+    pub async fn xread(
+        &mut self,
+        count: usize,
+        key: &str,
+        id: &str,
+    ) -> redis::RedisResult<Vec<(String, Vec<(String, String)>)>> {
+        let streams: Vec<Stream> = redis::cmd("XREAD")
+            .arg("COUNT")
+            .arg(count)
+            .arg("BLOCK")
+            .arg(0)
+            .arg("STREAMS")
             .arg(key)
             .arg(id)
-            .arg(data)
             .query_async(&mut self.connection)
-            .await
+            .await?;
+        // Taking the first stream
+        let stream = streams.into_iter().next().unwrap();
+        Ok(stream
+            .entries
+            .into_iter()
+            .map(|entry| {
+                let id = entry.id().unwrap();
+                let key_values = entry
+                    .key_values
+                    .into_iter()
+                    .map(|v| redis::from_redis_value::<String>(&v).unwrap())
+                    .tuples()
+                    .collect();
+                (id, key_values)
+            })
+            .collect())
     }
 }
