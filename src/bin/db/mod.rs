@@ -12,6 +12,7 @@ pub struct DB {
     pub connection: Connection,
 }
 
+#[allow(dead_code)]
 impl DB {
     pub async fn new() -> Self {
         let client = Client::open(env::var("REDIS_URL").expect("Missing REDIS_URL env var"))
@@ -21,6 +22,11 @@ impl DB {
             .await
             .expect("Failed to on Redis connection");
         Self { client, connection }
+    }
+
+    pub async fn reconnect(&mut self) -> redis::RedisResult<()> {
+        self.connection = self.client.get_async_connection().await?;
+        Ok(())
     }
 }
 

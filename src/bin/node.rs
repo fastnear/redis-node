@@ -10,6 +10,9 @@ const FINAL_BLOCKS_KEY: &str = "final_blocks";
 const BLOCK_KEY: &str = "block";
 const MAX_NUM_BLOCKS: Option<usize> = Some(100000);
 
+const MAX_RETRIES: usize = 10;
+const INITIAL_RETRY_DELAY: u64 = 100;
+
 fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
@@ -69,20 +72,27 @@ async fn listen_blocks(
             serde_json::to_string(&streamer_message).unwrap(),
         )];
 
-        // TODO: Retry
-        let id = format!("{}-0", streamer_message.block.header.height);
-        let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, MAX_NUM_BLOCKS).await;
-        match result {
-            Ok(res) => {
-                tracing::log::debug!(target: PROJECT_ID, "Added {}", res);
-            }
-            Err(res) => {
-                if res.kind() == redis::ErrorKind::ResponseError {
-                    tracing::log::debug!(target: PROJECT_ID, "Duplicate ID");
-                } else {
-                    panic!("Error: {}", res);
+        let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
+        for _ in 0..MAX_RETRIES {
+            let id = format!("{}-0", streamer_message.block.header.height);
+            let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, MAX_NUM_BLOCKS).await;
+            match result {
+                Ok(res) => {
+                    tracing::log::debug!(target: PROJECT_ID, "Added {}", res);
+                }
+                Err(res) => {
+                    if res.kind() == redis::ErrorKind::ResponseError {
+                        tracing::log::debug!(target: PROJECT_ID, "Duplicate ID");
+                    } else {
+                        tracing::log::error!(target: PROJECT_ID, "Error: {}", res);
+                        tokio::time::sleep(delay).await;
+                        let _ = db.reconnect().await;
+                        delay *= 2;
+                        continue;
+                    }
                 }
             }
+            break;
         }
     }
 }
