@@ -35,19 +35,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ("date".to_string(), timestamp_ms.to_string()),
                     ("yo".to_string(), "bar".to_string()),
                 ];
-                let res = db.xadd(stream_key, &id, &data, Some(MAX_LEN)).await;
-                match res {
-                    Ok(res) => {
-                        println!("Added {} with {}", res, timestamp_ms);
-                    }
-                    Err(res) => {
-                        if res.kind() == redis::ErrorKind::ResponseError {
-                            println!("Duplicate ID {}", id);
-                        } else {
-                            return Err(res.into());
+                let mut delay = tokio::time::Duration::from_millis(100);
+                for _ in 0..10 {
+                    let res = db.xadd(stream_key, &id, &data, Some(MAX_LEN)).await;
+                    match res {
+                        Ok(res) => {
+                            println!("Added {} with {}", res, timestamp_ms);
+                        }
+                        Err(err) => {
+                            if err.kind() == redis::ErrorKind::ResponseError {
+                                println!("Duplicate ID {}", id);
+                            } else {
+                                eprintln!("Error: {}", err);
+                                tokio::time::sleep(delay).await;
+                                let _ = db.reconnect().await;
+                                delay *= 2;
+                                continue;
+                            }
                         }
                     }
-                };
+                    break;
+                }
                 tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
         }
@@ -59,7 +67,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut last_id = last_id.unwrap_or("0".to_string());
             let mut cnt = 0;
             loop {
-                let res = db.xread(1, stream_key, &last_id).await?;
+                let res = db.xread(1, stream_key, &last_id).await;
+                let res = match res {
+                    Ok(res) => res,
+                    Err(err) => {
+                        eprintln!("Error: {}", err);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        let _ = db.reconnect().await;
+                        continue;
+                    }
+                };
                 let (id, key_values) = res.into_iter().next().unwrap();
                 println!("#{} {}: {:?}", cnt, id, key_values);
                 last_id = id;

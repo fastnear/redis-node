@@ -73,18 +73,18 @@ async fn listen_blocks(
         )];
 
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
+        let id = format!("{}-0", streamer_message.block.header.height);
         for _ in 0..MAX_RETRIES {
-            let id = format!("{}-0", streamer_message.block.header.height);
             let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, MAX_NUM_BLOCKS).await;
             match result {
                 Ok(res) => {
                     tracing::log::debug!(target: PROJECT_ID, "Added {}", res);
                 }
-                Err(res) => {
-                    if res.kind() == redis::ErrorKind::ResponseError {
+                Err(err) => {
+                    if err.kind() == redis::ErrorKind::ResponseError {
                         tracing::log::debug!(target: PROJECT_ID, "Duplicate ID");
                     } else {
-                        tracing::log::error!(target: PROJECT_ID, "Error: {}", res);
+                        tracing::log::error!(target: PROJECT_ID, "Error: {}", err);
                         tokio::time::sleep(delay).await;
                         let _ = db.reconnect().await;
                         delay *= 2;
