@@ -52,7 +52,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         "consume" => {
-            let mut last_id = "0".to_string();
+            let last_id = db.last_id(stream_key).await?;
+            if let Some(last_id) = last_id.as_ref() {
+                println!("Last ID: {}", last_id);
+            }
+            let mut last_id = last_id.unwrap_or("0".to_string());
             let mut cnt = 0;
             loop {
                 let res = db.xread(1, stream_key, &last_id).await?;

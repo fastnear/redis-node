@@ -3,9 +3,12 @@ mod db;
 
 use db::DB;
 use dotenv::dotenv;
+use near_indexer::near_primitives::types::BlockHeight;
 
 const PROJECT_ID: &str = "redisnode";
-const MAX_NUM_BLOCKS: Option<usize> = Some(1000000);
+const FINAL_BLOCKS_KEY: &str = "final_blocks";
+const BLOCK_KEY: &str = "block";
+const MAX_NUM_BLOCKS: Option<usize> = Some(100000);
 
 fn main() {
     openssl_probe::init_ssl_cert_env_vars();
@@ -25,15 +28,25 @@ fn main() {
 
     match command {
         "run" => {
-            let indexer_config = near_indexer::IndexerConfig {
-                home_dir,
-                sync_mode: near_indexer::SyncModeEnum::FromInterruption,
-                await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
-                validate_genesis: false,
-            };
             let sys = actix::System::new();
             sys.block_on(async move {
-                let db = DB::new().await;
+                let mut db = DB::new().await;
+                let last_id = db.last_id(FINAL_BLOCKS_KEY).await.unwrap();
+                let sync_mode = if let Some(last_id) = last_id {
+                    let last_block_height: BlockHeight =
+                        last_id.split_once("-").unwrap().0.parse().unwrap();
+                    near_indexer::SyncModeEnum::BlockHeight(last_block_height + 1)
+                } else {
+                    near_indexer::SyncModeEnum::FromInterruption
+                };
+
+                let indexer_config = near_indexer::IndexerConfig {
+                    home_dir,
+                    sync_mode,
+                    await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
+                    validate_genesis: false,
+                };
+
                 let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
                 let stream = indexer.streamer();
                 listen_blocks(stream, db).await;
@@ -52,13 +65,13 @@ async fn listen_blocks(
 ) {
     while let Some(streamer_message) = stream.recv().await {
         let data = vec![(
-            "block".to_string(),
+            BLOCK_KEY.to_string(),
             serde_json::to_string(&streamer_message).unwrap(),
         )];
 
         // TODO: Retry
         let id = format!("{}-0", streamer_message.block.header.height);
-        let result = db.xadd("blocks", &id, &data, MAX_NUM_BLOCKS).await;
+        let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, MAX_NUM_BLOCKS).await;
         match result {
             Ok(res) => {
                 tracing::log::debug!(target: PROJECT_ID, "Added {}", res);

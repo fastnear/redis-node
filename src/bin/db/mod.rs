@@ -101,4 +101,16 @@ impl DB {
             })
             .collect())
     }
+
+    pub async fn last_id(&mut self, key: &str) -> redis::RedisResult<Option<String>> {
+        let entries: Vec<Entry> = redis::cmd("XREVRANGE")
+            .arg(key)
+            .arg("+")
+            .arg("-")
+            .arg("COUNT")
+            .arg(1)
+            .query_async(&mut self.connection)
+            .await?;
+        Ok(entries.first().map(|e| e.id().unwrap()))
+    }
 }
