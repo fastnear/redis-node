@@ -4,11 +4,11 @@ mod db;
 use db::DB;
 use dotenv::dotenv;
 use near_indexer::near_primitives::types::BlockHeight;
+use std::env;
 
 const PROJECT_ID: &str = "redisnode";
 const FINAL_BLOCKS_KEY: &str = "final_blocks";
 const BLOCK_KEY: &str = "block";
-const MAX_NUM_BLOCKS: Option<usize> = Some(100000);
 
 const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
@@ -66,6 +66,8 @@ async fn listen_blocks(
     mut stream: tokio::sync::mpsc::Receiver<near_indexer::StreamerMessage>,
     mut db: DB,
 ) {
+    let max_num_blocks = env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok();
+
     while let Some(streamer_message) = stream.recv().await {
         let data = vec![(
             BLOCK_KEY.to_string(),
@@ -75,7 +77,7 @@ async fn listen_blocks(
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         let id = format!("{}-0", streamer_message.block.header.height);
         for _ in 0..MAX_RETRIES {
-            let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, MAX_NUM_BLOCKS).await;
+            let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, max_num_blocks).await;
             match result {
                 Ok(res) => {
                     tracing::log::debug!(target: PROJECT_ID, "Added {}", res);
