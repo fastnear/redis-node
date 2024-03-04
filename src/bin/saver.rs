@@ -1,8 +1,8 @@
-mod db;
+mod redis_db;
 
-use db::DB;
 use dotenv::dotenv;
 use near_indexer::near_primitives::types::BlockHeight;
+use redis_db::RedisDB;
 use std::io::Write;
 use std::{env, fs};
 
@@ -41,7 +41,7 @@ async fn main() {
         .unwrap_or("0".to_string());
     println!("Resuming from {}", last_block_height.unwrap_or(0));
 
-    let mut db = DB::new().await;
+    let mut db = RedisDB::new().await;
 
     loop {
         let res = db.xread(1, FINAL_BLOCKS_KEY, &last_id).await;

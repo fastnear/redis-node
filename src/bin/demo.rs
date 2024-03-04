@@ -1,6 +1,6 @@
 use dotenv::dotenv;
 
-mod db;
+mod redis_db;
 
 const MAX_LEN: usize = 100;
 
@@ -12,7 +12,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|arg| arg.as_str()).unwrap_or("");
 
-    let mut db = db::DB::new().await;
+    let mut db = redis_db::RedisDB::new().await;
     let stream_key = "test-stream";
 
     match command {

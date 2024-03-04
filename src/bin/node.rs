@@ -1,9 +1,9 @@
 mod common;
-mod db;
+mod redis_db;
 
-use db::DB;
 use dotenv::dotenv;
 use near_indexer::near_primitives::types::BlockHeight;
+use redis_db::RedisDB;
 use std::env;
 
 const PROJECT_ID: &str = "redisnode";
@@ -33,12 +33,16 @@ fn main() {
         "run" => {
             let sys = actix::System::new();
             sys.block_on(async move {
-                let mut db = DB::new().await;
+                let mut db = RedisDB::new().await;
                 let last_id = db.last_id(FINAL_BLOCKS_KEY).await.unwrap();
                 let sync_mode = if let Some(last_id) = last_id {
                     let last_block_height: BlockHeight =
                         last_id.split_once("-").unwrap().0.parse().unwrap();
                     near_indexer::SyncModeEnum::BlockHeight(last_block_height + 1)
+                } else if env::var("START_BLOCK").is_ok() {
+                    near_indexer::SyncModeEnum::BlockHeight(
+                        env::var("START_BLOCK").unwrap().parse().unwrap(),
+                    )
                 } else {
                     near_indexer::SyncModeEnum::FromInterruption
                 };
@@ -64,7 +68,7 @@ fn main() {
 
 async fn listen_blocks(
     mut stream: tokio::sync::mpsc::Receiver<near_indexer::StreamerMessage>,
-    mut db: DB,
+    mut db: RedisDB,
 ) {
     let max_num_blocks = env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok();
 
@@ -74,8 +78,9 @@ async fn listen_blocks(
             serde_json::to_string(&streamer_message).unwrap(),
         )];
 
-        let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         let id = format!("{}-0", streamer_message.block.header.height);
+
+        let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         for _ in 0..MAX_RETRIES {
             let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, max_num_blocks).await;
             match result {

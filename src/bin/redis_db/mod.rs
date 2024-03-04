@@ -7,13 +7,13 @@ use redis::aio::Connection;
 use redis::Client;
 use std::env;
 
-pub struct DB {
+pub struct RedisDB {
     pub client: Client,
     pub connection: Connection,
 }
 
 #[allow(dead_code)]
-impl DB {
+impl RedisDB {
     pub async fn new() -> Self {
         let client = Client::open(env::var("REDIS_URL").expect("Missing REDIS_URL env var"))
             .expect("Failed to connect to Redis");
@@ -31,7 +31,7 @@ impl DB {
 }
 
 #[allow(dead_code)]
-impl DB {
+impl RedisDB {
     pub async fn set(&mut self, key: &str, value: &str) -> redis::RedisResult<String> {
         redis::cmd("SET")
             .arg(key)
