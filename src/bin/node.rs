@@ -85,11 +85,11 @@ async fn listen_blocks(
             let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, max_num_blocks).await;
             match result {
                 Ok(res) => {
-                    tracing::log::debug!(target: PROJECT_ID, "Added {}", res);
+                    tracing::log::info!(target: PROJECT_ID, "Added {}", res);
                 }
                 Err(err) => {
                     if err.kind() == redis::ErrorKind::ResponseError {
-                        tracing::log::debug!(target: PROJECT_ID, "Duplicate ID");
+                        tracing::log::warn!(target: PROJECT_ID, "Duplicate ID: {}", err);
                     } else {
                         tracing::log::error!(target: PROJECT_ID, "Error: {}", err);
                         tokio::time::sleep(delay).await;
