@@ -89,7 +89,7 @@ async fn listen_blocks(
                 }
                 Err(err) => {
                     if err.kind() == redis::ErrorKind::ResponseError {
-                        tracing::log::warn!(target: PROJECT_ID, "Duplicate ID: {}", err);
+                        tracing::log::warn!(target: PROJECT_ID, "Duplicate ID {}: {}", id, err);
                     } else {
                         tracing::log::error!(target: PROJECT_ID, "Error: {}", err);
                         tokio::time::sleep(delay).await;
