@@ -3,6 +3,8 @@ mod common;
 mod redis_db;
 
 use crate::block_with_tx_hash::BlockWithTxHashes;
+use borsh::ser::BorshSerialize;
+use borsh::BorshDeserialize;
 use dotenv::dotenv;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::BlockHeight;
@@ -19,6 +21,8 @@ const INITIAL_RETRY_DELAY: u64 = 100;
 pub struct Config {
     pub stream_without_all_tx_hashes: bool,
     pub stream_to_redis: bool,
+    pub expect_tx_hashes: bool,
+    pub max_num_blocks: Option<usize>,
 }
 
 pub struct TxCache {
@@ -32,6 +36,10 @@ fn into_crypto_hash(hash: sled::InlineArray) -> CryptoHash {
 }
 
 impl TxCache {
+    pub fn flush(&self) {
+        self.db.flush().expect("Failed to flush");
+    }
+
     pub fn peek_receipt_to_tx(&self, receipt_id: &CryptoHash) -> Option<CryptoHash> {
         self.db
             .get(receipt_id)
@@ -61,6 +69,19 @@ impl TxCache {
             );
             tracing::log::warn!(target: PROJECT_ID, "Duplicate receipt_id: {} old_tx_hash: {} new_tx_hash: {}", receipt_id, old_tx_hash, tx_hash);
         }
+    }
+
+    pub fn get_last_block_height(&self) -> Option<BlockHeight> {
+        self.db
+            .get("last_block_height")
+            .expect("Failed to get last_block_height")
+            .map(|v| BlockHeight::try_from_slice(&v).expect("Failed to deserialize"))
+    }
+
+    pub fn set_last_block_height(&self, block_height: BlockHeight) {
+        self.db
+            .insert("last_block_height", block_height.try_to_vec().unwrap())
+            .expect("Failed to set last_block_height");
     }
 }
 
@@ -94,6 +115,9 @@ fn main() {
             == "true",
         stream_to_redis: env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var")
             == "true",
+        expect_tx_hashes: env::var("EXPECT_TX_HASHES").expect("Missing EXPECT_TX_HASHES env var")
+            == "true",
+        max_num_blocks: env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok(),
     };
 
     match command {
@@ -102,7 +126,14 @@ fn main() {
             sys.block_on(async move {
                 let mut db = RedisDB::new().await;
                 let last_id = db.last_id(FINAL_BLOCKS_KEY).await.unwrap();
-                let sync_mode = if let Some(last_id) = last_id {
+                let last_tx_cache_block = if config.expect_tx_hashes {
+                    tx_cache.get_last_block_height()
+                } else {
+                    None
+                };
+                let sync_mode = if let Some(last_tx_cache_block) = last_tx_cache_block {
+                    near_indexer::SyncModeEnum::BlockHeight(last_tx_cache_block + 1)
+                } else if let Some(last_id) = last_id {
                     let last_block_height: BlockHeight =
                         last_id.split_once("-").unwrap().0.parse().unwrap();
                     near_indexer::SyncModeEnum::BlockHeight(last_block_height + 1)
@@ -139,8 +170,6 @@ async fn listen_blocks(
     tx_cache: TxCache,
     config: Config,
 ) {
-    let max_num_blocks = env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok();
-
     while let Some(streamer_message) = stream.recv().await {
         let block_height = streamer_message.block.header.height;
         tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
@@ -165,7 +194,9 @@ async fn listen_blocks(
 
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         for _ in 0..MAX_RETRIES {
-            let result = db.xadd(FINAL_BLOCKS_KEY, &id, &data, max_num_blocks).await;
+            let result = db
+                .xadd(FINAL_BLOCKS_KEY, &id, &data, config.max_num_blocks)
+                .await;
             match result {
                 Ok(res) => {
                     tracing::log::info!(target: PROJECT_ID, "Added {}", res);
@@ -213,6 +244,9 @@ fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
             }
         }
     }
+
+    tx_cache.set_last_block_height(block.block.header.height);
+    tx_cache.flush();
 
     has_all_tx_hashes
 }
