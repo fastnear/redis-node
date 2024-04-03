@@ -1,7 +1,10 @@
+mod block_with_tx_hash;
 mod common;
 mod redis_db;
 
+use crate::block_with_tx_hash::BlockWithTxHashes;
 use dotenv::dotenv;
+use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::BlockHeight;
 use redis_db::RedisDB;
 use std::env;
@@ -13,9 +16,65 @@ const BLOCK_KEY: &str = "block";
 const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
 
+pub struct Config {
+    pub stream_without_all_tx_hashes: bool,
+    pub stream_to_redis: bool,
+}
+
+pub struct TxCache {
+    pub db: sled::Db,
+}
+
+fn into_crypto_hash(hash: sled::InlineArray) -> CryptoHash {
+    let mut result = CryptoHash::default();
+    result.0.copy_from_slice(&hash);
+    result
+}
+
+impl TxCache {
+    pub fn peek_receipt_to_tx(&self, receipt_id: &CryptoHash) -> Option<CryptoHash> {
+        self.db
+            .get(receipt_id)
+            .expect("Failed to remove")
+            .map(into_crypto_hash)
+    }
+
+    pub fn get_and_remove_receipt_to_tx(&self, receipt_id: &CryptoHash) -> Option<CryptoHash> {
+        self.db
+            .remove(receipt_id)
+            .expect("Failed to remove")
+            .map(into_crypto_hash)
+    }
+
+    pub fn store_receipt_to_tx(&self, receipt_id: &CryptoHash, tx_hash: &CryptoHash) {
+        let old_tx_hash = self
+            .db
+            .insert(receipt_id, tx_hash.0.to_vec())
+            .expect("Failed to insert")
+            .map(into_crypto_hash);
+
+        if let Some(old_tx_hash) = old_tx_hash {
+            assert_eq!(
+                &old_tx_hash, tx_hash,
+                "Duplicate receipt_id: {} with different TX HASHES!",
+                receipt_id
+            );
+            tracing::log::warn!(target: PROJECT_ID, "Duplicate receipt_id: {} old_tx_hash: {} new_tx_hash: {}", receipt_id, old_tx_hash, tx_hash);
+        }
+    }
+}
+
 fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
+
+    let sled_db_path = env::var("SLED_DB_PATH").expect("Missing SLED_DB_PATH env var");
+    if !std::path::Path::new(&sled_db_path).exists() {
+        std::fs::create_dir_all(&sled_db_path)
+            .expect(format!("Failed to create {}", sled_db_path).as_str());
+    }
+    let sled_db = sled::open(&sled_db_path).expect("Failed to open sled_db_path");
+    let tx_cache = TxCache { db: sled_db };
 
     let args: Vec<String> = std::env::args().collect();
     let home_dir = std::path::PathBuf::from(near_indexer::get_default_home());
@@ -28,6 +87,14 @@ fn main() {
         .get(1)
         .map(|arg| arg.as_str())
         .expect("You need to provide a command: `init` or `run` as arg");
+
+    let config = Config {
+        stream_without_all_tx_hashes: env::var("STREAM_WITHOUT_ALL_TX_HASHES")
+            .expect("Missing STREAM_WITHOUT_ALL_TX_HASHES env var")
+            == "true",
+        stream_to_redis: env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var")
+            == "true",
+    };
 
     match command {
         "run" => {
@@ -56,7 +123,7 @@ fn main() {
 
                 let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
                 let stream = indexer.streamer();
-                listen_blocks(stream, db).await;
+                listen_blocks(stream, db, tx_cache, config).await;
 
                 actix::System::current().stop();
             });
@@ -69,16 +136,32 @@ fn main() {
 async fn listen_blocks(
     mut stream: tokio::sync::mpsc::Receiver<near_indexer::StreamerMessage>,
     mut db: RedisDB,
+    tx_cache: TxCache,
+    config: Config,
 ) {
     let max_num_blocks = env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok();
 
     while let Some(streamer_message) = stream.recv().await {
+        let block_height = streamer_message.block.header.height;
+        tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
+        let mut block: BlockWithTxHashes = streamer_message.into();
+        let has_all_tx_hashes = process_block(&tx_cache, &mut block);
+
+        if !has_all_tx_hashes && !config.stream_without_all_tx_hashes {
+            tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
+            continue;
+        }
+
+        if !config.stream_to_redis {
+            continue;
+        }
+
         let data = vec![(
             BLOCK_KEY.to_string(),
-            serde_json::to_string(&streamer_message).unwrap(),
+            serde_json::to_string(&block).unwrap(),
         )];
 
-        let id = format!("{}-0", streamer_message.block.header.height);
+        let id = format!("{}-0", block_height);
 
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         for _ in 0..MAX_RETRIES {
@@ -102,4 +185,34 @@ async fn listen_blocks(
             break;
         }
     }
+}
+
+fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
+    let mut has_all_tx_hashes = true;
+    // Extract all tx_hashes first
+    for shard in &block.shards {
+        if let Some(chunk) = &shard.chunk {
+            for txwo in &chunk.transactions {
+                let tx_hash = txwo.transaction.hash;
+                for receipt_id in &txwo.outcome.execution_outcome.outcome.receipt_ids {
+                    tx_cache.store_receipt_to_tx(receipt_id, &tx_hash);
+                }
+            }
+        }
+    }
+    // Finding all matching tx_hashes
+    for shard in &mut block.shards {
+        for reo in &mut shard.receipt_execution_outcomes {
+            reo.tx_hash = tx_cache.get_and_remove_receipt_to_tx(&reo.receipt.receipt_id);
+            if let Some(tx_hash) = reo.tx_hash {
+                for receipt_id in &reo.execution_outcome.outcome.receipt_ids {
+                    tx_cache.store_receipt_to_tx(receipt_id, &tx_hash);
+                }
+            } else {
+                has_all_tx_hashes = false;
+            }
+        }
+    }
+
+    has_all_tx_hashes
 }
