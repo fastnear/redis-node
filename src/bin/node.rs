@@ -176,9 +176,11 @@ async fn listen_blocks(
         let mut block: BlockWithTxHashes = streamer_message.into();
         let has_all_tx_hashes = process_block(&tx_cache, &mut block);
 
-        if !has_all_tx_hashes && !config.stream_without_all_tx_hashes {
+        if !has_all_tx_hashes {
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
-            continue;
+            if !config.stream_without_all_tx_hashes {
+                continue;
+            }
         }
 
         if !config.stream_to_redis {
