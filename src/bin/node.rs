@@ -23,6 +23,7 @@ pub struct Config {
     pub stream_to_redis: bool,
     pub expect_tx_hashes: bool,
     pub max_num_blocks: Option<usize>,
+    pub panic_on_missing_tx_hashes: bool,
 }
 
 pub struct TxCache {
@@ -118,6 +119,9 @@ fn main() {
         expect_tx_hashes: env::var("EXPECT_TX_HASHES").expect("Missing EXPECT_TX_HASHES env var")
             == "true",
         max_num_blocks: env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok(),
+        panic_on_missing_tx_hashes: env::var("PANIC_ON_MISSING_TX_HASHES")
+            .expect("Missing PANIC_ON_MISSING_TX_HASHES env var")
+            == "true",
     };
 
     match command {
@@ -178,6 +182,9 @@ async fn listen_blocks(
 
         if !has_all_tx_hashes {
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
+            if config.panic_on_missing_tx_hashes {
+                panic!("Block {} is missing some tx hashes", block_height);
+            }
             if !config.stream_without_all_tx_hashes {
                 continue;
             }
