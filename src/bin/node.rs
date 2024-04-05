@@ -204,7 +204,8 @@ async fn listen_blocks(
                     tracing::log::info!(target: PROJECT_ID, "Added {}", res);
                 }
                 Err(err) => {
-                    if err.kind() == redis::ErrorKind::ResponseError {
+                    if err.kind() == redis::ErrorKind::ResponseError &&
+                        err.to_string().contains("The ID specified in XADD is equal or smaller than the target stream top item") {
                         tracing::log::warn!(target: PROJECT_ID, "Duplicate ID {}: {}", id, err);
                     } else {
                         tracing::log::error!(target: PROJECT_ID, "Error: {}", err);
