@@ -50,7 +50,7 @@ async fn main() {
     let mut read_db = RedisDB::new(None).await;
 
     let path = env::var("ARCHIVAL_DATA_PATH").expect("ARCHIVAL_DATA_PATH is not set");
-    let last_block_height = last_block_height(&path);
+    let last_block_height = last_block_height(&path) / save_every_n * save_every_n;
 
     let (id, _key_values) = read_db
         .xread(1, FINAL_BLOCKS_KEY, "0")
@@ -63,18 +63,14 @@ async fn main() {
     let min_start_block =
         (first_block_height + SAFE_OFFSET + save_every_n) / save_every_n * save_every_n;
 
-    let mut start_block = last_block_height
-        .unwrap_or(min_start_block)
-        .saturating_sub(1)
-        / save_every_n
-        * save_every_n;
+    let mut start_block = last_block_height.unwrap_or(min_start_block);
 
     if start_block < first_block_height + SAFE_OFFSET {
         tracing::warn!(target: PROJECT_ID, "Start block is too early, resetting to {}", min_start_block);
         start_block = min_start_block;
     }
 
-    let mut last_id = format!("{}-0", start_block);
+    let mut last_id = format!("{}-0", start_block.saturation_sub(1));
     tracing::info!(target: PROJECT_ID, "Resuming from {}", last_id);
 
     let mut cache_db = RedisDB::new(Some(
