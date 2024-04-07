@@ -128,7 +128,7 @@ fn main() {
         "run" => {
             let sys = actix::System::new();
             sys.block_on(async move {
-                let mut db = RedisDB::new().await;
+                let mut db = RedisDB::new(None).await;
                 let last_id = db.last_id(FINAL_BLOCKS_KEY).await.unwrap();
                 let last_tx_cache_block = if config.expect_tx_hashes {
                     tx_cache.get_last_block_height()

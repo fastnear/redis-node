@@ -1,6 +1,6 @@
 [package]
 name = "redis-node"
-version = "0.2.4"
+version = "0.3.0"
 authors = ["Eugene The Dream"]
 rust-version = "1.75.0"
 edition = "2021"
@@ -16,6 +16,10 @@ path = "src/bin/node.rs"
 [[bin]]
 name = "saver"
 path = "src/bin/saver.rs"
+
+[[bin]]
+name = "caching-saver"
+path = "src/bin/caching_saver.rs"
 
 [dependencies]
 actix = "=0.13.0"
@@ -49,3 +53,6 @@ redis = { version = "0.25.2", features = ["tokio-comp", "tokio-native-tls-comp",
 
 sled = "=1.0.0-alpha.120"
 borsh = "0.9.0"
+
+tar = "0.4"
+flate2 = "1.0"
