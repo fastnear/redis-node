@@ -106,12 +106,7 @@ async fn main() {
         // Update cache
 
         with_retries!(cache_db, |connection| async {
-            set_block(connection, &chain_id, block_height, &value).await
-        })
-        .expect("Failed to set block in cache");
-
-        with_retries!(cache_db, |connection| async {
-            set_last_block_height(connection, &chain_id, block_height).await
+            set_block_and_last_block_height(connection, &chain_id, block_height, &value).await
         })
         .expect("Failed to set last block height in cache");
 
@@ -157,31 +152,23 @@ fn save_blocks(
     Ok(())
 }
 
-pub(crate) async fn set_block(
+pub(crate) async fn set_block_and_last_block_height(
     connection: &mut MultiplexedConnection,
     chain_id: &str,
     block_height: BlockHeight,
     block: &str,
 ) -> Result<(), redis::RedisError> {
-    let key = format!("b:{}:{}", chain_id, block_height);
-    redis::cmd("SET")
-        .arg(&key)
+    redis::pipe()
+        .cmd("SET")
+        .arg(format!("b:{}:{}", chain_id, block_height))
         .arg(block)
         .arg("EX")
         .arg(CACHE_EXPIRATION.as_secs())
-        .query_async(connection)
-        .await
-}
-
-pub(crate) async fn set_last_block_height(
-    connection: &mut MultiplexedConnection,
-    chain_id: &str,
-    block_height: BlockHeight,
-) -> Result<(), redis::RedisError> {
-    let key = format!("meta:{}:last_block", chain_id);
-    redis::cmd("SET")
-        .arg(&key)
+        .ignore()
+        .cmd("SET")
+        .arg(format!("meta:{}:last_block", chain_id))
         .arg(block_height)
+        .ignore()
         .query_async(connection)
         .await
 }
