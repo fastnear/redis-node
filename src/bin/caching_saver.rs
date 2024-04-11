@@ -46,7 +46,7 @@ async fn main() {
         .unwrap();
 
     let chain_id = env::var("CHAIN_ID").expect("CHAIN_ID is not set");
-    common::setup_tracing("redis=info,saver=info");
+    common::setup_tracing("redis=info,saver=debug");
     let mut read_db = RedisDB::new(None).await;
 
     let path = env::var("ARCHIVAL_DATA_PATH").expect("ARCHIVAL_DATA_PATH is not set");
@@ -79,6 +79,7 @@ async fn main() {
     ))
     .await;
 
+    let mut last_block_height: BlockHeight = 0;
     let mut blocks = vec![];
     loop {
         let res = read_db.xread(1, FINAL_BLOCKS_KEY, &last_id).await;
@@ -105,13 +106,22 @@ async fn main() {
         }
         // Update cache
 
+        let mut blocks_to_update = vec![(block_height, value.as_str())];
+        if block_height > last_block_height && block_height - last_block_height < 10 {
+            for i in last_block_height + 1..block_height {
+                tracing::debug!(target: PROJECT_ID, "Filling gap at skipped block: {}", i);
+                blocks_to_update.push((i, ""));
+            }
+        }
         with_retries!(cache_db, |connection| async {
-            set_block_and_last_block_height(connection, &chain_id, block_height, &value).await
+            set_block_and_last_block_height(connection, &chain_id, block_height, &blocks_to_update)
+                .await
         })
         .expect("Failed to set last block height in cache");
 
         blocks.push((block_height, value));
         last_id = id;
+        last_block_height = block_height;
     }
 }
 
@@ -155,19 +165,22 @@ fn save_blocks(
 pub(crate) async fn set_block_and_last_block_height(
     connection: &mut MultiplexedConnection,
     chain_id: &str,
-    block_height: BlockHeight,
-    block: &str,
+    last_block_height: BlockHeight,
+    blocks: &[(BlockHeight, &str)],
 ) -> Result<(), redis::RedisError> {
-    redis::pipe()
-        .cmd("SET")
-        .arg(format!("b:{}:{}", chain_id, block_height))
-        .arg(block)
-        .arg("EX")
-        .arg(CACHE_EXPIRATION.as_secs())
-        .ignore()
-        .cmd("SET")
+    let mut pipe = redis::pipe();
+
+    for (block_height, block) in blocks {
+        pipe.cmd("SET")
+            .arg(format!("b:{}:{}", chain_id, block_height))
+            .arg(block)
+            .arg("EX")
+            .arg(CACHE_EXPIRATION.as_secs())
+            .ignore();
+    }
+    pipe.cmd("SET")
         .arg(format!("meta:{}:last_block", chain_id))
-        .arg(block_height)
+        .arg(last_block_height)
         .ignore()
         .query_async(connection)
         .await
