@@ -11,7 +11,6 @@ pub type BlockHeight = u64;
 const PROJECT_ID: &str = "saver";
 const SAFE_OFFSET: u64 = 100;
 
-const FINAL_BLOCKS_KEY: &str = "final_blocks";
 const BLOCK_KEY: &str = "block";
 const CACHE_EXPIRATION: std::time::Duration = std::time::Duration::from_secs(60);
 
@@ -40,6 +39,8 @@ async fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
+    let final_blocks_key = env::var("FINAL_BLOCKS_KEY").unwrap_or("final_blocks".to_string());
+
     let save_every_n = env::var("SAVE_EVERY_N")
         .expect("SAVE_EVERY_N is not set")
         .parse()
@@ -53,7 +54,7 @@ async fn main() {
     let last_block_height = last_block_height(&path);
 
     let (id, _key_values) = read_db
-        .xread(1, FINAL_BLOCKS_KEY, "0")
+        .xread(1, &final_blocks_key, "0")
         .await
         .expect("Failed to get the first block from Redis")
         .into_iter()
@@ -74,15 +75,18 @@ async fn main() {
     let mut last_id = format!("{}-0", start_block.saturating_sub(1));
     tracing::info!(target: PROJECT_ID, "Resuming from {}", last_id);
 
-    let mut cache_db = RedisDB::new(Some(
-        env::var("CACHE_REDIS_URL").expect("Missing CACHE_REDIS_URL env var"),
-    ))
-    .await;
+    let mut cache_db = if let Some(cache_url) = env::var("CACHE_REDIS_URL").ok() {
+        tracing::info!(target: PROJECT_ID, "Connecting to cache redis");
+        Some(RedisDB::new(Some(cache_url)).await)
+    } else {
+        tracing::info!(target: PROJECT_ID, "No cache redis URL provided");
+        None
+    };
 
     let mut last_block_height: BlockHeight = 0;
     let mut blocks = vec![];
     loop {
-        let res = read_db.xread(1, FINAL_BLOCKS_KEY, &last_id).await;
+        let res = read_db.xread(1, &final_blocks_key, &last_id).await;
         let res = match res {
             Ok(res) => res,
             Err(err) => {
@@ -113,11 +117,18 @@ async fn main() {
                 blocks_to_update.push((i, ""));
             }
         }
-        with_retries!(cache_db, |connection| async {
-            set_block_and_last_block_height(connection, &chain_id, block_height, &blocks_to_update)
+        if let Some(cache_db) = cache_db.as_mut() {
+            with_retries!(cache_db, |connection| async {
+                set_block_and_last_block_height(
+                    connection,
+                    &chain_id,
+                    block_height,
+                    &blocks_to_update,
+                )
                 .await
-        })
-        .expect("Failed to set last block height in cache");
+            })
+            .expect("Failed to set last block height in cache");
+        }
 
         blocks.push((block_height, value));
         last_id = id;

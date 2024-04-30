@@ -12,7 +12,6 @@ use redis_db::RedisDB;
 use std::env;
 
 const PROJECT_ID: &str = "redisnode";
-const FINAL_BLOCKS_KEY: &str = "final_blocks";
 const BLOCK_KEY: &str = "block";
 
 const MAX_RETRIES: usize = 10;
@@ -24,6 +23,7 @@ pub struct Config {
     pub expect_tx_hashes: bool,
     pub max_num_blocks: Option<usize>,
     pub panic_on_missing_tx_hashes: bool,
+    pub final_blocks_key: String,
 }
 
 pub struct TxCache {
@@ -90,6 +90,8 @@ fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
+    let final_blocks_key = env::var("FINAL_BLOCKS_KEY").unwrap_or("final_blocks".to_string());
+
     let sled_db_path = env::var("SLED_DB_PATH").expect("Missing SLED_DB_PATH env var");
     if !std::path::Path::new(&sled_db_path).exists() {
         std::fs::create_dir_all(&sled_db_path)
@@ -122,6 +124,7 @@ fn main() {
         panic_on_missing_tx_hashes: env::var("PANIC_ON_MISSING_TX_HASHES")
             .expect("Missing PANIC_ON_MISSING_TX_HASHES env var")
             == "true",
+        final_blocks_key,
     };
 
     match command {
@@ -129,7 +132,7 @@ fn main() {
             let sys = actix::System::new();
             sys.block_on(async move {
                 let mut db = RedisDB::new(None).await;
-                let last_id = db.last_id(FINAL_BLOCKS_KEY).await.unwrap();
+                let last_id = db.last_id(&config.final_blocks_key).await.unwrap();
                 let last_tx_cache_block = if config.expect_tx_hashes {
                     tx_cache.get_last_block_height()
                 } else {
@@ -204,7 +207,7 @@ async fn listen_blocks(
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         for _ in 0..MAX_RETRIES {
             let result = db
-                .xadd(FINAL_BLOCKS_KEY, &id, &data, config.max_num_blocks)
+                .xadd(&config.final_blocks_key, &id, &data, config.max_num_blocks)
                 .await;
             match result {
                 Ok(res) => {
