@@ -113,6 +113,7 @@ fn main() {
         .expect("You need to provide a command: `init` or `run` as arg");
 
     let config = Config {
+        strict: env::var("STRICT").expect("Missing STRICT env var") == "true",
         stream_without_all_tx_hashes: env::var("STREAM_WITHOUT_ALL_TX_HASHES")
             .expect("Missing STREAM_WITHOUT_ALL_TX_HASHES env var")
             == "true",
@@ -138,12 +139,16 @@ fn main() {
                 } else {
                     None
                 };
+                let last_redis_block_height = last_id
+                    .as_ref()
+                    .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
                 let sync_mode = if let Some(last_tx_cache_block) = last_tx_cache_block {
+                    if config.strict {
+                        assert_eq!(last_tx_cache_block, last_redis_block_height.unwrap());
+                    }
                     near_indexer::SyncModeEnum::BlockHeight(last_tx_cache_block + 1)
                 } else if let Some(last_id) = last_id {
-                    let last_block_height: BlockHeight =
-                        last_id.split_once("-").unwrap().0.parse().unwrap();
-                    near_indexer::SyncModeEnum::BlockHeight(last_block_height + 1)
+                    near_indexer::SyncModeEnum::BlockHeight(last_redis_block_height.unwrap() + 1)
                 } else if env::var("START_BLOCK").is_ok() {
                     near_indexer::SyncModeEnum::BlockHeight(
                         env::var("START_BLOCK").unwrap().parse().unwrap(),

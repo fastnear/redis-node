@@ -13,8 +13,7 @@ use tokio::sync::mpsc;
 
 const PROJECT_ID: &str = "backfill";
 
-#[tokio::main]
-async fn main() {
+fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
@@ -32,9 +31,15 @@ async fn main() {
         validate_genesis: false,
     };
 
-    let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
-    let stream = streamer(indexer);
-    listen_blocks(stream, &save_path).await;
+    let sys = actix::System::new();
+    sys.block_on(async move {
+        let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
+        let stream = streamer(indexer);
+        listen_blocks(stream, &save_path).await;
+
+        actix::System::current().stop();
+    });
+    sys.run().unwrap();
 }
 
 fn read_missing_blocks() -> Vec<BlockHeight> {
