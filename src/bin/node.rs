@@ -18,7 +18,7 @@ const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
 
 pub struct Config {
-    pub stream_without_all_tx_hashes: bool,
+    pub strict: bool,
     pub stream_to_redis: bool,
     pub expect_tx_hashes: bool,
     pub max_num_blocks: Option<usize>,
@@ -114,9 +114,6 @@ fn main() {
 
     let config = Config {
         strict: env::var("STRICT").expect("Missing STRICT env var") == "true",
-        stream_without_all_tx_hashes: env::var("STREAM_WITHOUT_ALL_TX_HASHES")
-            .expect("Missing STREAM_WITHOUT_ALL_TX_HASHES env var")
-            == "true",
         stream_to_redis: env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var")
             == "true",
         expect_tx_hashes: env::var("EXPECT_TX_HASHES").expect("Missing EXPECT_TX_HASHES env var")
@@ -139,15 +136,18 @@ fn main() {
                 } else {
                     None
                 };
-                let last_redis_block_height = last_id
+                let last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
                 let sync_mode = if let Some(last_tx_cache_block) = last_tx_cache_block {
                     if config.strict {
-                        assert_eq!(last_tx_cache_block, last_redis_block_height.unwrap());
+                        assert!(
+                            last_tx_cache_block <= last_redis_block_height.unwrap(),
+                            "Last tx cache block is greater than last redis block height"
+                        );
                     }
                     near_indexer::SyncModeEnum::BlockHeight(last_tx_cache_block + 1)
-                } else if let Some(last_id) = last_id {
+                } else if last_id.is_some() {
                     near_indexer::SyncModeEnum::BlockHeight(last_redis_block_height.unwrap() + 1)
                 } else if env::var("START_BLOCK").is_ok() {
                     near_indexer::SyncModeEnum::BlockHeight(
@@ -166,7 +166,7 @@ fn main() {
 
                 let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
                 let stream = indexer.streamer();
-                listen_blocks(stream, db, tx_cache, config).await;
+                listen_blocks(stream, db, tx_cache, config, last_redis_block_height).await;
 
                 actix::System::current().stop();
             });
@@ -181,7 +181,9 @@ async fn listen_blocks(
     mut db: RedisDB,
     tx_cache: TxCache,
     config: Config,
+    last_redis_block_height: Option<BlockHeight>,
 ) {
+    let redis_block = last_redis_block_height.unwrap_or(0);
     while let Some(streamer_message) = stream.recv().await {
         let block_height = streamer_message.block.header.height;
         tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
@@ -190,15 +192,12 @@ async fn listen_blocks(
 
         if !has_all_tx_hashes {
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
-            if config.panic_on_missing_tx_hashes {
+            if redis_block < block_height && config.panic_on_missing_tx_hashes {
                 panic!("Block {} is missing some tx hashes", block_height);
-            }
-            if !config.stream_without_all_tx_hashes {
-                continue;
             }
         }
 
-        if !config.stream_to_redis {
+        if !config.stream_to_redis || redis_block >= block_height {
             continue;
         }
 
