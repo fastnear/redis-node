@@ -1,6 +1,6 @@
 [package]
 name = "redis-node"
-version = "0.3.6"
+version = "0.4.0"
 authors = ["Eugene The Dream"]
 rust-version = "1.75.0"
 edition = "2021"
@@ -20,6 +20,10 @@ path = "src/bin/saver.rs"
 [[bin]]
 name = "caching-saver"
 path = "src/bin/caching_saver.rs"
+
+[[bin]]
+name = "backfill"
+path = "src/bin/backfill.rs"
 
 [dependencies]
 actix = "=0.13.0"
@@ -44,7 +48,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1.6"
 
-near-indexer = { git = "https://github.com/near/nearcore", rev = "1.39.1" }
+near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "256b555c7686078e2e25bceed8828e25e9fdbdd5" }
 
 itertools = "0.12.0"
 
