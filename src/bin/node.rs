@@ -3,13 +3,14 @@ mod common;
 mod redis_db;
 
 use crate::block_with_tx_hash::BlockWithTxHashes;
-use borsh::ser::BorshSerialize;
 use borsh::BorshDeserialize;
 use dotenv::dotenv;
 use near_indexer::near_primitives::hash::CryptoHash;
-use near_indexer::near_primitives::types::BlockHeight;
+use near_indexer::near_primitives::types::{BlockHeight, Finality};
 use redis_db::RedisDB;
 use std::env;
+
+pub type BlockHashes = Vec<CryptoHash>;
 
 const PROJECT_ID: &str = "redisnode";
 const BLOCK_KEY: &str = "block";
@@ -17,13 +18,19 @@ const BLOCK_KEY: &str = "block";
 const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
 
+/// The number of blocks of receipts to keep in the cache before we start cleaning up.
+/// It's necessary to keep receipts in memory for longer than one block in order to support
+/// reorgs when streaming optimistic blocks.
+const RECEIPT_HASH_CLEANUP_BLOCKS: u64 = 10;
+
 pub struct Config {
     pub strict: bool,
     pub stream_to_redis: bool,
     pub expect_tx_hashes: bool,
     pub max_num_blocks: Option<usize>,
     pub panic_on_missing_tx_hashes: bool,
-    pub final_blocks_key: String,
+    pub blocks_key: String,
+    pub finality: Finality,
 }
 
 pub struct TxCache {
@@ -81,8 +88,37 @@ impl TxCache {
 
     pub fn set_last_block_height(&self, block_height: BlockHeight) {
         self.db
-            .insert("last_block_height", block_height.try_to_vec().unwrap())
+            .insert("last_block_height", borsh::to_vec(&block_height).unwrap())
             .expect("Failed to set last_block_height");
+    }
+
+    pub fn set_receipt_hashes_to_remove(
+        &self,
+        block_height: BlockHeight,
+        receipt_hashes: BlockHashes,
+    ) {
+        self.db
+            .insert(
+                format!("block_hashes:{}", block_height),
+                borsh::to_vec(&receipt_hashes).unwrap(),
+            )
+            .expect("Failed to set receipt_hashes_to_remove");
+    }
+
+    pub fn clean_receipt_hashes_to_remove(&self, block_height: BlockHeight) {
+        let v = self
+            .db
+            .remove(format!("block_hashes:{}", block_height))
+            .expect("Failed to clean receipt_hashes_to_remove");
+        if let Some(v) = v {
+            let receipt_hashes: BlockHashes =
+                BorshDeserialize::try_from_slice(&v).expect("Failed to deserialize");
+            for receipt_hash in receipt_hashes {
+                self.db
+                    .remove(&receipt_hash)
+                    .expect("Failed to clean receipt_hashes_to_remove");
+            }
+        }
     }
 }
 
@@ -90,7 +126,10 @@ fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
-    let final_blocks_key = env::var("FINAL_BLOCKS_KEY").unwrap_or("final_blocks".to_string());
+    let finality: Finality =
+        serde_json::from_str(&env::var("FINALITY").unwrap_or("final".to_string()))
+            .expect("Failed to parse Finality");
+    let blocks_key = env::var("BLOCKS_KEY").expect("Missing BLOCKS_KEY env var");
 
     let sled_db_path = env::var("SLED_DB_PATH").expect("Missing SLED_DB_PATH env var");
     if !std::path::Path::new(&sled_db_path).exists() {
@@ -122,7 +161,8 @@ fn main() {
         panic_on_missing_tx_hashes: env::var("PANIC_ON_MISSING_TX_HASHES")
             .expect("Missing PANIC_ON_MISSING_TX_HASHES env var")
             == "true",
-        final_blocks_key,
+        blocks_key,
+        finality,
     };
 
     match command {
@@ -130,7 +170,7 @@ fn main() {
             let sys = actix::System::new();
             sys.block_on(async move {
                 let mut db = RedisDB::new(None).await;
-                let last_id = db.last_id(&config.final_blocks_key).await.unwrap();
+                let last_id = db.last_id(&config.blocks_key).await.unwrap();
                 let last_tx_cache_block = if config.expect_tx_hashes {
                     tx_cache.get_last_block_height()
                 } else {
@@ -162,6 +202,8 @@ fn main() {
                     sync_mode,
                     await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
                     validate_genesis: false,
+                    interval: std::time::Duration::from_millis(50),
+                    finality: config.finality.clone(),
                 };
 
                 let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
@@ -206,12 +248,16 @@ async fn listen_blocks(
             serde_json::to_string(&block).unwrap(),
         )];
 
-        let id = format!("{}-0", block_height);
+        let id = if config.finality == Finality::Final {
+            format!("{}-0", block_height)
+        } else {
+            format!("{}-*", block_height)
+        };
 
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         for _ in 0..MAX_RETRIES {
             let result = db
-                .xadd(&config.final_blocks_key, &id, &data, config.max_num_blocks)
+                .xadd(&config.blocks_key, &id, &data, config.max_num_blocks)
                 .await;
             match result {
                 Ok(res) => {
@@ -237,6 +283,7 @@ async fn listen_blocks(
 
 fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
     let mut has_all_tx_hashes = true;
+    let mut receipt_hashes_to_remove = vec![];
     // Extract all tx_hashes first
     for shard in &block.shards {
         if let Some(chunk) = &shard.chunk {
@@ -251,7 +298,8 @@ fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
     // Finding all matching tx_hashes
     for shard in &mut block.shards {
         for reo in &mut shard.receipt_execution_outcomes {
-            reo.tx_hash = tx_cache.get_and_remove_receipt_to_tx(&reo.receipt.receipt_id);
+            reo.tx_hash = tx_cache.peek_receipt_to_tx(&reo.receipt.receipt_id);
+            receipt_hashes_to_remove.push(reo.receipt.receipt_id);
             if let Some(tx_hash) = reo.tx_hash {
                 for receipt_id in &reo.execution_outcome.outcome.receipt_ids {
                     tx_cache.store_receipt_to_tx(receipt_id, &tx_hash);
@@ -262,7 +310,11 @@ fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
         }
     }
 
-    tx_cache.set_last_block_height(block.block.header.height);
+    let block_height = block.block.header.height;
+    tx_cache.set_receipt_hashes_to_remove(block_height, receipt_hashes_to_remove);
+    tx_cache
+        .clean_receipt_hashes_to_remove(block_height.saturating_sub(RECEIPT_HASH_CLEANUP_BLOCKS));
+    tx_cache.set_last_block_height(block_height);
     tx_cache.flush();
 
     has_all_tx_hashes
