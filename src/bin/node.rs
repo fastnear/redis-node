@@ -17,6 +17,7 @@ const BLOCK_KEY: &str = "block";
 
 const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
+const RECEIPT_BACKFILL_DEPTH: u64 = 100;
 
 /// The number of blocks of receipts to keep in the cache before we start cleaning up.
 /// It's necessary to keep receipts in memory for longer than one block in order to support
@@ -24,11 +25,8 @@ const INITIAL_RETRY_DELAY: u64 = 100;
 const RECEIPT_HASH_CLEANUP_BLOCKS: u64 = 10;
 
 pub struct Config {
-    pub strict: bool,
     pub stream_to_redis: bool,
-    pub expect_tx_hashes: bool,
     pub max_num_blocks: Option<usize>,
-    pub panic_on_missing_tx_hashes: bool,
     pub blocks_key: String,
     pub finality: Finality,
 }
@@ -127,7 +125,7 @@ fn main() {
     dotenv().ok();
 
     let finality: Finality =
-        serde_json::from_str(&env::var("FINALITY").unwrap_or("\"final\"".to_string()))
+        serde_json::from_str(&env::var("FINALITY").expect("Missing FINALITY env var"))
             .expect("Failed to parse Finality");
     let blocks_key = env::var("BLOCKS_KEY").expect("Missing BLOCKS_KEY env var");
 
@@ -152,15 +150,9 @@ fn main() {
         .expect("You need to provide a command: `init` or `run` as arg");
 
     let config = Config {
-        strict: env::var("STRICT").expect("Missing STRICT env var") == "true",
         stream_to_redis: env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var")
             == "true",
-        expect_tx_hashes: env::var("EXPECT_TX_HASHES").expect("Missing EXPECT_TX_HASHES env var")
-            == "true",
         max_num_blocks: env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok(),
-        panic_on_missing_tx_hashes: env::var("PANIC_ON_MISSING_TX_HASHES")
-            .expect("Missing PANIC_ON_MISSING_TX_HASHES env var")
-            == "true",
         blocks_key,
         finality,
     };
@@ -171,24 +163,22 @@ fn main() {
             sys.block_on(async move {
                 let mut db = RedisDB::new(None).await;
                 let last_id = db.last_id(&config.blocks_key).await.unwrap();
-                let last_tx_cache_block = if config.expect_tx_hashes {
-                    tx_cache.get_last_block_height()
-                } else {
-                    None
-                };
+                let last_tx_cache_block = tx_cache.get_last_block_height().unwrap_or(0);
                 let last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
-                let sync_mode = if let Some(last_tx_cache_block) = last_tx_cache_block {
-                    if config.strict {
-                        assert!(
-                            last_tx_cache_block <= last_redis_block_height.unwrap(),
-                            "Last tx cache block is greater than last redis block height"
-                        );
+                let sync_mode = if let Some(last_redis_block_height) = last_redis_block_height {
+                    // There is data in the redis. We need to stream closer to this height.
+                    let next_block = last_redis_block_height + 1;
+                    if last_tx_cache_block > next_block {
+                        // Have to backfill
+                        near_indexer::SyncModeEnum::BlockHeight(next_block - RECEIPT_BACKFILL_DEPTH)
+                    } else {
+                        // Backfill or catch up
+                        near_indexer::SyncModeEnum::BlockHeight(
+                            last_tx_cache_block.max(next_block - RECEIPT_BACKFILL_DEPTH),
+                        )
                     }
-                    near_indexer::SyncModeEnum::BlockHeight(last_tx_cache_block + 1)
-                } else if last_id.is_some() {
-                    near_indexer::SyncModeEnum::BlockHeight(last_redis_block_height.unwrap() + 1)
                 } else if env::var("START_BLOCK").is_ok() {
                     near_indexer::SyncModeEnum::BlockHeight(
                         env::var("START_BLOCK").unwrap().parse().unwrap(),
@@ -234,7 +224,7 @@ async fn listen_blocks(
 
         if !has_all_tx_hashes {
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
-            if redis_block < block_height && config.panic_on_missing_tx_hashes {
+            if redis_block < block_height {
                 panic!("Block {} is missing some tx hashes", block_height);
             }
         }
