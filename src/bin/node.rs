@@ -127,7 +127,7 @@ fn main() {
     dotenv().ok();
 
     let finality: Finality =
-        serde_json::from_str(&env::var("FINALITY").unwrap_or("final".to_string()))
+        serde_json::from_str(&env::var("FINALITY").unwrap_or("\"final\"".to_string()))
             .expect("Failed to parse Finality");
     let blocks_key = env::var("BLOCKS_KEY").expect("Missing BLOCKS_KEY env var");
 
