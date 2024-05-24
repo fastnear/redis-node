@@ -274,6 +274,8 @@ async fn listen_blocks(
 fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
     let mut has_all_tx_hashes = true;
     let mut receipt_hashes_to_remove = vec![];
+
+    let last_block_height = tx_cache.get_last_block_height();
     // Extract all tx_hashes first
     for shard in &block.shards {
         if let Some(chunk) = &shard.chunk {
@@ -302,8 +304,14 @@ fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
 
     let block_height = block.block.header.height;
     tx_cache.set_receipt_hashes_to_remove(block_height, receipt_hashes_to_remove);
-    tx_cache
-        .clean_receipt_hashes_to_remove(block_height.saturating_sub(RECEIPT_HASH_CLEANUP_BLOCKS));
+    if let Some(last_block_height) = last_block_height {
+        let diff = block_height.saturating_sub(last_block_height);
+        for i in 0..=diff.min(RECEIPT_HASH_CLEANUP_BLOCKS) {
+            tx_cache.clean_receipt_hashes_to_remove(
+                last_block_height.saturating_sub(RECEIPT_HASH_CLEANUP_BLOCKS - i),
+            );
+        }
+    }
     tx_cache.set_last_block_height(block_height);
     tx_cache.flush();
 
