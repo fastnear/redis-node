@@ -238,11 +238,7 @@ async fn listen_blocks(
             serde_json::to_string(&block).unwrap(),
         )];
 
-        let id = if config.finality == Finality::Final {
-            format!("{}-0", block_height)
-        } else {
-            format!("{}-*", block_height)
-        };
+        let id = format!("{}-0", block_height);
 
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
         for _ in 0..MAX_RETRIES {
