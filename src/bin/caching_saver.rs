@@ -9,7 +9,7 @@ use std::{env, fs};
 pub type BlockHeight = u64;
 
 const PROJECT_ID: &str = "saver";
-const SAFE_OFFSET: u64 = 100;
+const SAFE_OFFSET: u64 = 30;
 
 const BLOCK_KEY: &str = "block";
 const CACHE_EXPIRATION: std::time::Duration = std::time::Duration::from_secs(60);
