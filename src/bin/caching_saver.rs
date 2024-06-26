@@ -14,7 +14,7 @@ const SAFE_OFFSET: u64 = 100;
 const BLOCK_KEY: &str = "block";
 const CACHE_EXPIRATION: std::time::Duration = std::time::Duration::from_secs(60);
 
-fn read_folder(path: &str) -> Vec<String> {
+fn read_folder(path: &String) -> Vec<String> {
     let mut entries: Vec<String> = fs::read_dir(path)
         .unwrap()
         .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
@@ -23,7 +23,7 @@ fn read_folder(path: &str) -> Vec<String> {
     entries
 }
 
-fn last_block_height(path: &str) -> Option<BlockHeight> {
+fn last_block_height(path: &String) -> Option<BlockHeight> {
     let last_outer = read_folder(path).last().cloned()?;
     let last_thousand = read_folder(&format!("{}/{}", path, last_outer))
         .last()
@@ -39,7 +39,7 @@ async fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
-    let final_blocks_key = env::var("FINAL_BLOCKS_KEY").unwrap_or("final_blocks".to_string());
+    let blocks_key = env::var("BLOCKS_KEY").unwrap_or("final_blocks".to_string());
 
     let save_every_n = env::var("SAVE_EVERY_N")
         .expect("SAVE_EVERY_N is not set")
@@ -50,11 +50,11 @@ async fn main() {
     common::setup_tracing("redis=info,saver=debug");
     let mut read_db = RedisDB::new(None).await;
 
-    let path = env::var("ARCHIVAL_DATA_PATH").expect("ARCHIVAL_DATA_PATH is not set");
-    let last_block_height = last_block_height(&path);
+    let path = env::var("ARCHIVAL_DATA_PATH").ok();
+    let last_block_height = path.as_ref().and_then(last_block_height);
 
     let (id, _key_values) = read_db
-        .xread(1, &final_blocks_key, "0")
+        .xread(1, &blocks_key, "0")
         .await
         .expect("Failed to get the first block from Redis")
         .into_iter()
@@ -86,7 +86,7 @@ async fn main() {
     let mut last_block_height: BlockHeight = 0;
     let mut blocks = vec![];
     loop {
-        let res = read_db.xread(1, &final_blocks_key, &last_id).await;
+        let res = read_db.xread(1, &blocks_key, &last_id).await;
         let res = match res {
             Ok(res) => res,
             Err(err) => {
@@ -105,7 +105,7 @@ async fn main() {
         if blocks.get(0).map(|(height, _block)| *height).unwrap_or(0) / save_every_n
             != block_height / save_every_n
         {
-            save_blocks(&blocks, path.as_str(), save_every_n).unwrap();
+            save_blocks(&blocks, path.as_ref(), save_every_n).unwrap();
             blocks.clear();
         }
         // Update cache
@@ -138,17 +138,17 @@ async fn main() {
 
 fn save_blocks(
     blocks: &[(BlockHeight, String)],
-    path: &str,
+    path: Option<&String>,
     save_every_n: u64,
 ) -> std::io::Result<()> {
-    if blocks.is_empty() {
+    if blocks.is_empty() || path.is_none() {
         return Ok(());
     }
     let starting_block = blocks[0].0 / save_every_n * save_every_n;
     let padded_block_height = format!("{:0>12}", starting_block);
     let path = format!(
         "{}/{}/{}",
-        path,
+        path.unwrap(),
         &padded_block_height[..6],
         &padded_block_height[6..9]
     );
