@@ -131,7 +131,7 @@ async fn main() {
         }
 
         blocks.push((block_height, value));
-        last_id = id;
+        last_id = format!("{}-{}", block_height, 1000000);
         last_block_height = block_height;
     }
 }
