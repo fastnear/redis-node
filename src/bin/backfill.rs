@@ -8,6 +8,7 @@ use near_indexer::streamer::build_streamer_message;
 use near_indexer::streamer::fetchers::fetch_block_by_height;
 use near_indexer::{Indexer, StreamerMessage};
 use std::io::Write;
+use std::time::Duration;
 use std::{env, fs};
 use tokio::sync::mpsc;
 
@@ -29,6 +30,8 @@ fn main() {
         sync_mode: near_indexer::SyncModeEnum::FromInterruption,
         await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
         validate_genesis: false,
+        interval: Duration::from_millis(500),
+        finality: Default::default(),
     };
 
     let sys = actix::System::new();

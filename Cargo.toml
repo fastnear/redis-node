@@ -1,6 +1,6 @@
 [package]
 name = "redis-node"
-version = "0.6.3"
+version = "0.6.4"
 authors = ["Eugene The Dream"]
 rust-version = "1.79.0"
 edition = "2021"
@@ -24,6 +24,10 @@ path = "src/bin/caching_saver.rs"
 [[bin]]
 name = "backfill"
 path = "src/bin/backfill.rs"
+
+[[bin]]
+name = "backfill-and-save"
+path = "src/bin/backfill_and_save.rs"
 
 [dependencies]
 actix = "=0.13.0"
