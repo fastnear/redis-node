@@ -62,9 +62,7 @@ impl TxCache {
         block_height: BlockHeight,
         receipt_hashes: BlockHashes,
     ) {
-        self.block_hashes
-            .insert(block_height, receipt_hashes)
-            .expect("Failed to set receipt_hashes_to_remove");
+        self.block_hashes.insert(block_height, receipt_hashes);
     }
 
     pub fn clean_receipt_hashes_to_remove(&mut self, block_height: BlockHeight) {
