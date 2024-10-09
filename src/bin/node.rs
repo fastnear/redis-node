@@ -17,7 +17,7 @@ const BLOCK_KEY: &str = "block";
 
 const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
-const RECEIPT_BACKFILL_DEPTH: u64 = 100;
+const RECEIPT_BACKFILL_DEPTH: u64 = 250;
 
 /// The number of blocks of receipts to keep in the cache before we start cleaning up.
 /// It's necessary to keep receipts in memory for longer than one block in order to support
