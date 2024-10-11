@@ -29,6 +29,8 @@ fn main() {
         sync_mode: near_indexer::SyncModeEnum::FromInterruption,
         await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
         validate_genesis: false,
+        interval: Default::default(),
+        finality: Default::default(),
     };
 
     let sys = actix::System::new();

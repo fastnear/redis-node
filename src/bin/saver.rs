@@ -35,13 +35,16 @@ async fn main() {
     dotenv().ok();
 
     let path = env::var("DATA_PATH").expect("DATA_PATH is not set");
+    // Get env var for Redis URL if set
+    let redis_url_opt: Option<String> = env::var("CACHE_REDIS_URL").ok();
     let last_block_height = last_block_height(&path);
     let mut last_id = last_block_height
         .map(|h| format!("{}-0", h))
         .unwrap_or("0".to_string());
     println!("Resuming from {}", last_block_height.unwrap_or(0));
 
-    let mut db = RedisDB::new().await;
+    // Uses CACHE_REDIS_URL env var if it's set, otherwise provides None
+    let mut db = RedisDB::new(redis_url_opt).await;
 
     loop {
         let res = db.xread(1, FINAL_BLOCKS_KEY, &last_id).await;

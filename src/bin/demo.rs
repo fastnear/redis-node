@@ -1,3 +1,4 @@
+use std::env;
 use dotenv::dotenv;
 
 mod redis_db;
@@ -12,7 +13,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     let command = args.get(1).map(|arg| arg.as_str()).unwrap_or("");
 
-    let mut db = redis_db::RedisDB::new().await;
+    // Get env var for Redis URL if set
+    let redis_url_opt: Option<String> = env::var("CACHE_REDIS_URL").ok();
+
+    // Uses CACHE_REDIS_URL env var if it's set, otherwise provides None
+    let mut db = redis_db::RedisDB::new(redis_url_opt).await;
     let stream_key = "test-stream";
 
     match command {
