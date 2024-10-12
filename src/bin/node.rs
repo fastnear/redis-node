@@ -113,7 +113,7 @@ fn main() {
                 let mut db = RedisDB::new(None).await;
                 let last_id = db.last_id(&config.blocks_key).await.unwrap();
                 let last_tx_cache_block = 0;
-                let last_redis_block_height: Option<BlockHeight> = last_id
+                let mut last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
                 let sync_mode = if let Some(last_redis_block_height) = last_redis_block_height {
@@ -129,8 +129,10 @@ fn main() {
                         )
                     }
                 } else if env::var("START_BLOCK").is_ok() {
+                    let start_block_height = env::var("START_BLOCK").unwrap().parse().unwrap();
+                    last_redis_block_height = Some(start_block_height - 1);
                     near_indexer::SyncModeEnum::BlockHeight(
-                        env::var("START_BLOCK").unwrap().parse().unwrap(),
+                        start_block_height - RECEIPT_BACKFILL_DEPTH - 1,
                     )
                 } else {
                     near_indexer::SyncModeEnum::FromInterruption
