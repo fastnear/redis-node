@@ -129,7 +129,8 @@ fn main() {
                         )
                     }
                 } else if env::var("START_BLOCK").is_ok() {
-                    let start_block_height = env::var("START_BLOCK").unwrap().parse().unwrap();
+                    let start_block_height: BlockHeight =
+                        env::var("START_BLOCK").unwrap().parse().unwrap();
                     last_redis_block_height = Some(start_block_height - 1);
                     near_indexer::SyncModeEnum::BlockHeight(
                         start_block_height - RECEIPT_BACKFILL_DEPTH - 1,
