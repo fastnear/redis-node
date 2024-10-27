@@ -216,7 +216,7 @@ async fn listen_blocks(
                     }
                 }
             }
-            break;
+            panic!("Failed to write to redis. Don't want to skip the block");
         }
     }
 }
