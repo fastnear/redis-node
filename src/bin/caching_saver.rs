@@ -5,6 +5,7 @@ use dotenv::dotenv;
 use futures::future::join_all;
 use redis::aio::MultiplexedConnection;
 use redis_db::RedisDB;
+use std::sync::{Arc, RwLock};
 use std::{env, fs};
 use tokio::sync::mpsc;
 
@@ -51,8 +52,9 @@ async fn block_producer(
     mut redis_db: RedisDB,
     blocks_key: String,
     sink: mpsc::Sender<(BlockHeight, String)>,
-    mut last_id: String,
+    last_processed_block: Arc<RwLock<BlockHeight>>,
 ) {
+    let mut last_id = format!("{}-0", *last_processed_block.read().unwrap());
     loop {
         let res = redis_db.xread(1, &blocks_key, &last_id).await;
         let res = match res {
@@ -71,7 +73,12 @@ async fn block_producer(
         let block_height: BlockHeight = id.split_once("-").unwrap().0.parse().unwrap();
         tracing::debug!(target: PROJECT_ID, "Adding block {} from redis {:?}", block_height, redis_db.client.get_connection_info().addr);
         sink.send((block_height, value)).await.unwrap();
-        last_id = id;
+        let current_processed_block = *last_processed_block.read().unwrap();
+        if current_processed_block > block_height {
+            last_id = format!("{}-0", current_processed_block);
+        } else {
+            last_id = id;
+        }
     }
 }
 
@@ -135,9 +142,9 @@ async fn main() {
         start_block = min_start_block;
     }
 
-    let last_id = format!("{}-0", start_block.saturating_sub(1));
+    let last_processed_block = Arc::new(RwLock::new(start_block.saturating_sub(1)));
 
-    tracing::info!(target: PROJECT_ID, "Resuming from {}", last_id);
+    tracing::info!(target: PROJECT_ID, "Resuming from {}", last_processed_block.read().unwrap());
 
     let mut cache_db = if let Some(cache_url) = env::var("CACHE_REDIS_URL").ok() {
         tracing::info!(target: PROJECT_ID, "Connecting to cache redis");
@@ -155,8 +162,8 @@ async fn main() {
     for db in read_dbs {
         let blocks_key = blocks_key.clone();
         let sender = sender.clone();
-        let last_id = last_id.clone();
-        tokio::spawn(block_producer(db, blocks_key, sender, last_id));
+        let last_processed_block = last_processed_block.clone();
+        tokio::spawn(block_producer(db, blocks_key, sender, last_processed_block));
     }
 
     let mut last_block_height: BlockHeight = 0;
@@ -166,6 +173,7 @@ async fn main() {
             continue;
         }
         tracing::debug!(target: PROJECT_ID, "Processing block: {}", block_height);
+        *last_processed_block.write().unwrap() = block_height;
 
         if blocks.get(0).map(|(height, _block)| *height).unwrap_or(0) / save_every_n
             != block_height / save_every_n
