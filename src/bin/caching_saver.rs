@@ -69,7 +69,7 @@ async fn block_producer(
         let (key, value) = key_values.into_iter().next().unwrap();
         assert_eq!(key, BLOCK_KEY, "Expected key to be block");
         let block_height: BlockHeight = id.split_once("-").unwrap().0.parse().unwrap();
-        tracing::debug!(target: PROJECT_ID, "Redis {:?} is sending block: {}", redis_db.client.get_connection_info().addr, block_height);
+        tracing::debug!(target: PROJECT_ID, "Adding block {} from redis {:?}", block_height, redis_db.client.get_connection_info().addr);
         sink.send((block_height, value)).await.unwrap();
         last_id = id;
     }
