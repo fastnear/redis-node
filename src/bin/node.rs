@@ -195,18 +195,23 @@ async fn listen_blocks(
         let id = format!("{}-0", block_height);
 
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
-        for _ in 0..MAX_RETRIES {
+        for iter in 0..=MAX_RETRIES {
+            if iter == MAX_RETRIES {
+                panic!("Failed to write to redis. Don't want to skip the block");
+            }
             let result = db
                 .xadd(&config.blocks_key, &id, &data, config.max_num_blocks)
                 .await;
             match result {
                 Ok(res) => {
                     tracing::log::info!(target: PROJECT_ID, "Added {}", res);
+                    break;
                 }
                 Err(err) => {
                     if err.kind() == redis::ErrorKind::ResponseError &&
                         err.to_string().contains("The ID specified in XADD is equal or smaller than the target stream top item") {
                         tracing::log::warn!(target: PROJECT_ID, "Duplicate ID {}: {}", id, err);
+                        break;
                     } else {
                         tracing::log::error!(target: PROJECT_ID, "Error: {}", err);
                         tokio::time::sleep(delay).await;
@@ -216,7 +221,6 @@ async fn listen_blocks(
                     }
                 }
             }
-            panic!("Failed to write to redis. Don't want to skip the block");
         }
     }
 }
