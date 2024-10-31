@@ -1,6 +1,6 @@
 [package]
 name = "redis-node"
-version = "0.6.8-rc.3"
+version = "0.7.0"
 authors = ["Eugene The Dream"]
 rust-version = "1.81.0"
 edition = "2021"
@@ -39,7 +39,7 @@ bigdecimal = "=0.1.0"
 anyhow = "1.0.51"
 
 openssl-probe = { version = "0.1.5" }
-# futures = "0.3.5"
+futures = "0.3"
 tokio = { version = "1.38", features = ["time", "sync", "rt-multi-thread"] }
 tokio-stream = { version = "0.1" }
 tokio-retry = "0.3.0"
@@ -52,7 +52,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1.6"
 
-near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "4b95186bbc5e8d102ec00d9587a99b0bb035d6a6" }
+near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "3a32fb3f286ad0493cec84255dadfe548102ecd1" }
 borsh = "1.5.0"
 
 itertools = "0.12.0"

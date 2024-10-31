@@ -14,16 +14,12 @@ pub struct RedisDB {
 
 #[allow(dead_code)]
 impl RedisDB {
-    pub async fn new(redis_url: Option<String>) -> Self {
+    pub async fn new(redis_url: Option<String>) -> redis::RedisResult<Self> {
         let client = Client::open(
             redis_url.unwrap_or_else(|| env::var("REDIS_URL").expect("Missing REDIS_URL env var")),
-        )
-        .expect("Failed to connect to Redis");
-        let connection = client
-            .get_multiplexed_async_connection()
-            .await
-            .expect("Failed to on Redis connection");
-        Self { client, connection }
+        )?;
+        let connection = client.get_multiplexed_async_connection().await?;
+        Ok(Self { client, connection })
     }
 
     pub async fn reconnect(&mut self) -> redis::RedisResult<()> {

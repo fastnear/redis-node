@@ -110,7 +110,7 @@ fn main() {
         "run" => {
             let sys = actix::System::new();
             sys.block_on(async move {
-                let mut db = RedisDB::new(None).await;
+                let mut db = RedisDB::new(None).await?;
                 let last_id = db.last_id(&config.blocks_key).await.unwrap();
                 let last_tx_cache_block = 0;
                 let mut last_redis_block_height: Option<BlockHeight> = last_id
