@@ -4,6 +4,7 @@ mod redis_db;
 
 use crate::block_with_tx_hash::BlockWithTxHashes;
 use dotenv::dotenv;
+use fastnear_neardata_fetcher::fetcher;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
 use redis_db::RedisDB;
@@ -18,6 +19,7 @@ const BLOCK_KEY: &str = "block";
 const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
 const RECEIPT_BACKFILL_DEPTH: u64 = 250;
+const EMPTY_REDIS_DEPTH: u64 = 1000;
 
 /// The number of blocks of receipts to keep in the cache before we start cleaning up.
 /// It's necessary to keep receipts in memory for longer than one block in order to support
@@ -136,7 +138,21 @@ fn main() {
                         start_block_height - RECEIPT_BACKFILL_DEPTH - 1,
                     )
                 } else {
-                    near_indexer::SyncModeEnum::FromInterruption
+                    let client = reqwest::Client::new();
+                    let chain_id = fastnear_primitives::types::ChainId::try_from(
+                        env::var("CHAIN_ID").expect("CHAIN_ID is not set"),
+                    )
+                    .expect("Invalid chain id");
+                    let last_block_height = fetcher::fetch_last_block(&client, chain_id)
+                        .await
+                        .expect("Last block doesn't exists")
+                        .block
+                        .header
+                        .height;
+                    last_redis_block_height = Some(last_block_height - EMPTY_REDIS_DEPTH);
+                    near_indexer::SyncModeEnum::BlockHeight(
+                        last_redis_block_height.clone().unwrap() - RECEIPT_BACKFILL_DEPTH - 1,
+                    )
                 };
 
                 let indexer_config = near_indexer::IndexerConfig {
