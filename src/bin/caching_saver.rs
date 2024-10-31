@@ -128,7 +128,7 @@ async fn main() {
     let first_block_height = first_block_heights
         .iter()
         .filter_map(|h| *h)
-        .min()
+        .max()
         .expect("No blocks found in Redis");
 
     let min_start_block =
