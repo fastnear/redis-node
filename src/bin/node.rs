@@ -3,11 +3,12 @@ mod common;
 mod redis_db;
 
 use crate::block_with_tx_hash::BlockWithTxHashes;
-use borsh::BorshDeserialize;
 use dotenv::dotenv;
+use fastnear_neardata_fetcher::fetcher;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
 use redis_db::RedisDB;
+use std::collections::HashMap;
 use std::env;
 
 pub type BlockHashes = Vec<CryptoHash>;
@@ -17,7 +18,8 @@ const BLOCK_KEY: &str = "block";
 
 const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
-const RECEIPT_BACKFILL_DEPTH: u64 = 100;
+const RECEIPT_BACKFILL_DEPTH: u64 = 250;
+const EMPTY_REDIS_DEPTH: u64 = 1000;
 
 /// The number of blocks of receipts to keep in the cache before we start cleaning up.
 /// It's necessary to keep receipts in memory for longer than one block in order to support
@@ -31,41 +33,21 @@ pub struct Config {
     pub finality: Finality,
 }
 
+#[derive(Default)]
 pub struct TxCache {
-    pub db: sled::Db,
-}
-
-fn into_crypto_hash(hash: sled::InlineArray) -> CryptoHash {
-    let mut result = CryptoHash::default();
-    result.0.copy_from_slice(&hash);
-    result
+    pub receipt_to_tx: HashMap<CryptoHash, CryptoHash>,
+    pub block_hashes: HashMap<BlockHeight, BlockHashes>,
 }
 
 impl TxCache {
-    pub fn flush(&self) {
-        self.db.flush().expect("Failed to flush");
-    }
-
     pub fn peek_receipt_to_tx(&self, receipt_id: &CryptoHash) -> Option<CryptoHash> {
-        self.db
-            .get(receipt_id)
-            .expect("Failed to remove")
-            .map(into_crypto_hash)
+        self.receipt_to_tx.get(receipt_id).cloned()
     }
 
-    pub fn get_and_remove_receipt_to_tx(&self, receipt_id: &CryptoHash) -> Option<CryptoHash> {
-        self.db
-            .remove(receipt_id)
-            .expect("Failed to remove")
-            .map(into_crypto_hash)
-    }
-
-    pub fn store_receipt_to_tx(&self, receipt_id: &CryptoHash, tx_hash: &CryptoHash) {
+    pub fn store_receipt_to_tx(&mut self, receipt_id: &CryptoHash, tx_hash: &CryptoHash) {
         let old_tx_hash = self
-            .db
-            .insert(receipt_id, tx_hash.0.to_vec())
-            .expect("Failed to insert")
-            .map(into_crypto_hash);
+            .receipt_to_tx
+            .insert(receipt_id.clone(), tx_hash.clone());
 
         if let Some(old_tx_hash) = old_tx_hash {
             assert_eq!(
@@ -77,44 +59,19 @@ impl TxCache {
         }
     }
 
-    pub fn get_last_block_height(&self) -> Option<BlockHeight> {
-        self.db
-            .get("last_block_height")
-            .expect("Failed to get last_block_height")
-            .map(|v| BlockHeight::try_from_slice(&v).expect("Failed to deserialize"))
-    }
-
-    pub fn set_last_block_height(&self, block_height: BlockHeight) {
-        self.db
-            .insert("last_block_height", borsh::to_vec(&block_height).unwrap())
-            .expect("Failed to set last_block_height");
-    }
-
     pub fn set_receipt_hashes_to_remove(
-        &self,
+        &mut self,
         block_height: BlockHeight,
         receipt_hashes: BlockHashes,
     ) {
-        self.db
-            .insert(
-                format!("block_hashes:{}", block_height),
-                borsh::to_vec(&receipt_hashes).unwrap(),
-            )
-            .expect("Failed to set receipt_hashes_to_remove");
+        self.block_hashes.insert(block_height, receipt_hashes);
     }
 
-    pub fn clean_receipt_hashes_to_remove(&self, block_height: BlockHeight) {
-        let v = self
-            .db
-            .remove(format!("block_hashes:{}", block_height))
-            .expect("Failed to clean receipt_hashes_to_remove");
-        if let Some(v) = v {
-            let receipt_hashes: BlockHashes =
-                BorshDeserialize::try_from_slice(&v).expect("Failed to deserialize");
+    pub fn clean_receipt_hashes_to_remove(&mut self, block_height: BlockHeight) {
+        let receipt_hashes = self.block_hashes.remove(&block_height);
+        if let Some(receipt_hashes) = receipt_hashes {
             for receipt_hash in receipt_hashes {
-                self.db
-                    .remove(&receipt_hash)
-                    .expect("Failed to clean receipt_hashes_to_remove");
+                self.receipt_to_tx.remove(&receipt_hash);
             }
         }
     }
@@ -129,13 +86,7 @@ fn main() {
             .expect("Failed to parse Finality");
     let blocks_key = env::var("BLOCKS_KEY").expect("Missing BLOCKS_KEY env var");
 
-    let sled_db_path = env::var("SLED_DB_PATH").expect("Missing SLED_DB_PATH env var");
-    if !std::path::Path::new(&sled_db_path).exists() {
-        std::fs::create_dir_all(&sled_db_path)
-            .expect(format!("Failed to create {}", sled_db_path).as_str());
-    }
-    let sled_db = sled::open(&sled_db_path).expect("Failed to open sled_db_path");
-    let tx_cache = TxCache { db: sled_db };
+    let tx_cache = TxCache::default();
 
     let args: Vec<String> = std::env::args().collect();
     let home_dir = std::path::PathBuf::from(near_indexer::get_default_home());
@@ -161,10 +112,10 @@ fn main() {
         "run" => {
             let sys = actix::System::new();
             sys.block_on(async move {
-                let mut db = RedisDB::new(None).await;
+                let mut db = RedisDB::new(None).await.unwrap();
                 let last_id = db.last_id(&config.blocks_key).await.unwrap();
-                let last_tx_cache_block = tx_cache.get_last_block_height().unwrap_or(0);
-                let last_redis_block_height: Option<BlockHeight> = last_id
+                let last_tx_cache_block = 0;
+                let mut last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
                 let sync_mode = if let Some(last_redis_block_height) = last_redis_block_height {
@@ -180,11 +131,28 @@ fn main() {
                         )
                     }
                 } else if env::var("START_BLOCK").is_ok() {
+                    let start_block_height: BlockHeight =
+                        env::var("START_BLOCK").unwrap().parse().unwrap();
+                    last_redis_block_height = Some(start_block_height - 1);
                     near_indexer::SyncModeEnum::BlockHeight(
-                        env::var("START_BLOCK").unwrap().parse().unwrap(),
+                        start_block_height - RECEIPT_BACKFILL_DEPTH - 1,
                     )
                 } else {
-                    near_indexer::SyncModeEnum::FromInterruption
+                    let client = reqwest::Client::new();
+                    let chain_id = fastnear_primitives::types::ChainId::try_from(
+                        env::var("CHAIN_ID").expect("CHAIN_ID is not set"),
+                    )
+                    .expect("Invalid chain id");
+                    let last_block_height = fetcher::fetch_last_block(&client, chain_id)
+                        .await
+                        .expect("Last block doesn't exists")
+                        .block
+                        .header
+                        .height;
+                    last_redis_block_height = Some(last_block_height - EMPTY_REDIS_DEPTH);
+                    near_indexer::SyncModeEnum::BlockHeight(
+                        last_redis_block_height.clone().unwrap() - RECEIPT_BACKFILL_DEPTH - 1,
+                    )
                 };
 
                 let indexer_config = near_indexer::IndexerConfig {
@@ -211,16 +179,18 @@ fn main() {
 async fn listen_blocks(
     mut stream: tokio::sync::mpsc::Receiver<near_indexer::StreamerMessage>,
     mut db: RedisDB,
-    tx_cache: TxCache,
+    mut tx_cache: TxCache,
     config: Config,
     last_redis_block_height: Option<BlockHeight>,
 ) {
     let redis_block = last_redis_block_height.unwrap_or(0);
+    let mut last_block_height = None;
     while let Some(streamer_message) = stream.recv().await {
         let block_height = streamer_message.block.header.height;
         tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
         let mut block: BlockWithTxHashes = streamer_message.into();
-        let has_all_tx_hashes = process_block(&tx_cache, &mut block);
+        let has_all_tx_hashes = process_block(&mut tx_cache, &mut block, last_block_height);
+        last_block_height = Some(block_height);
 
         if !has_all_tx_hashes {
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
@@ -241,18 +211,23 @@ async fn listen_blocks(
         let id = format!("{}-0", block_height);
 
         let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
-        for _ in 0..MAX_RETRIES {
+        for iter in 0..=MAX_RETRIES {
+            if iter == MAX_RETRIES {
+                panic!("Failed to write to redis. Don't want to skip the block");
+            }
             let result = db
                 .xadd(&config.blocks_key, &id, &data, config.max_num_blocks)
                 .await;
             match result {
                 Ok(res) => {
                     tracing::log::info!(target: PROJECT_ID, "Added {}", res);
+                    break;
                 }
                 Err(err) => {
                     if err.kind() == redis::ErrorKind::ResponseError &&
                         err.to_string().contains("The ID specified in XADD is equal or smaller than the target stream top item") {
                         tracing::log::warn!(target: PROJECT_ID, "Duplicate ID {}: {}", id, err);
+                        break;
                     } else {
                         tracing::log::error!(target: PROJECT_ID, "Error: {}", err);
                         tokio::time::sleep(delay).await;
@@ -262,16 +237,17 @@ async fn listen_blocks(
                     }
                 }
             }
-            break;
         }
     }
 }
 
-fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
+fn process_block(
+    tx_cache: &mut TxCache,
+    block: &mut BlockWithTxHashes,
+    last_block_height: Option<BlockHeight>,
+) -> bool {
     let mut has_all_tx_hashes = true;
     let mut receipt_hashes_to_remove = vec![];
-
-    let last_block_height = tx_cache.get_last_block_height();
     // Extract all tx_hashes first
     for shard in &block.shards {
         if let Some(chunk) = &shard.chunk {
@@ -308,8 +284,6 @@ fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
             );
         }
     }
-    tx_cache.set_last_block_height(block_height);
-    tx_cache.flush();
 
     has_all_tx_hashes
 }

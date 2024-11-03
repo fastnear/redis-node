@@ -1,8 +1,8 @@
 [package]
 name = "redis-node"
-version = "0.5.5"
+version = "0.7.0"
 authors = ["Eugene The Dream"]
-rust-version = "1.75.0"
+rust-version = "1.81.0"
 edition = "2021"
 
 [[bin]]
@@ -25,6 +25,10 @@ path = "src/bin/caching_saver.rs"
 name = "backfill"
 path = "src/bin/backfill.rs"
 
+[[bin]]
+name = "backfill-and-save"
+path = "src/bin/backfill_and_save.rs"
+
 [dependencies]
 actix = "=0.13.0"
 actix-web = "4.3.0"
@@ -34,9 +38,9 @@ actix-rt = "2.2.0"
 bigdecimal = "=0.1.0"
 anyhow = "1.0.51"
 
-openssl-probe = { version = "0.1.2" }
-# futures = "0.3.5"
-tokio = { version = "1.1", features = ["time", "sync", "rt-multi-thread"] }
+openssl-probe = { version = "0.1.5" }
+futures = "0.3"
+tokio = { version = "1.38", features = ["time", "sync", "rt-multi-thread"] }
 tokio-stream = { version = "0.1" }
 tokio-retry = "0.3.0"
 
@@ -48,15 +52,23 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1.6"
 
-near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "08484cda251ba23d3f697f640d21eaefae7783f9" }
+near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "3a32fb3f286ad0493cec84255dadfe548102ecd1" }
 borsh = "1.5.0"
 
 itertools = "0.12.0"
 
 ### Redis
-redis = { version = "0.25.2", features = ["tokio-comp", "tokio-native-tls-comp", "streams"] }
-
-sled = "=1.0.0-alpha.120"
+redis = { version = "0.26.0", features = ["tokio-comp", "tokio-native-tls-comp", "streams"] }
 
 tar = "0.4"
 flate2 = "1.0"
+
+fastnear-primitives = "0.0.2"
+fastnear-neardata-fetcher = "0.0.2"
+reqwest = { version = "0.12", features = ["json"] }
+
+[profile.release]
+overflow-checks = true
+panic = 'abort'
+lto = "fat"
+codegen-units = 1

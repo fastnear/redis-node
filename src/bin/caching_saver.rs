@@ -2,9 +2,12 @@ mod common;
 mod redis_db;
 
 use dotenv::dotenv;
+use futures::future::join_all;
 use redis::aio::MultiplexedConnection;
 use redis_db::RedisDB;
+use std::sync::{Arc, RwLock};
 use std::{env, fs};
+use tokio::sync::mpsc;
 
 pub type BlockHeight = u64;
 
@@ -34,6 +37,51 @@ fn last_block_height(path: &String) -> Option<BlockHeight> {
     last_file.split_once(".").unwrap().0.parse().ok()
 }
 
+async fn first_block_id(read_db: &mut RedisDB, blocks_key: &str) -> Option<BlockHeight> {
+    let (id, _key_values) = read_db
+        .xread(1, blocks_key, "0")
+        .await
+        .map_err(|e| tracing::error!(target: PROJECT_ID, "Failed to get the first block from Redis: {}", e))
+        .ok()?
+        .into_iter()
+        .next()?;
+    Some(id.split_once("-").unwrap().0.parse().unwrap())
+}
+
+async fn block_producer(
+    mut redis_db: RedisDB,
+    blocks_key: String,
+    sink: mpsc::Sender<(BlockHeight, String)>,
+    last_processed_block: Arc<RwLock<BlockHeight>>,
+) {
+    let mut last_id = format!("{}-0", *last_processed_block.read().unwrap());
+    loop {
+        let res = redis_db.xread(1, &blocks_key, &last_id).await;
+        let res = match res {
+            Ok(res) => res,
+            Err(err) => {
+                tracing::error!(target: PROJECT_ID, "Error: {}", err);
+                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                let _ = redis_db.reconnect().await;
+                continue;
+            }
+        };
+        let (id, key_values) = res.into_iter().next().unwrap();
+        assert_eq!(key_values.len(), 1, "Expected 1 key-value pair");
+        let (key, value) = key_values.into_iter().next().unwrap();
+        assert_eq!(key, BLOCK_KEY, "Expected key to be block");
+        let block_height: BlockHeight = id.split_once("-").unwrap().0.parse().unwrap();
+        tracing::debug!(target: PROJECT_ID, "Adding block {} from redis {:?}", block_height, redis_db.client.get_connection_info().addr);
+        sink.send((block_height, value)).await.unwrap();
+        let current_processed_block = *last_processed_block.read().unwrap();
+        if current_processed_block > block_height {
+            last_id = format!("{}-0", current_processed_block);
+        } else {
+            last_id = id;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     openssl_probe::init_ssl_cert_env_vars();
@@ -48,19 +96,41 @@ async fn main() {
 
     let chain_id = env::var("CHAIN_ID").expect("CHAIN_ID is not set");
     common::setup_tracing("redis=info,saver=debug");
-    let mut read_db = RedisDB::new(None).await;
+    let redis_urls: Vec<_> = env::var("REDIS_URL")
+        .expect("REDIS_URL is not set")
+        .split(',')
+        .map(|s| s.to_string())
+        .collect();
+    let mut read_dbs = vec![];
+    for url in &redis_urls {
+        match RedisDB::new(Some(url.to_string())).await {
+            Ok(db) => read_dbs.push(db),
+            Err(e) => {
+                tracing::error!(target: PROJECT_ID, "Failed to connect to Redis ({}): {}", url, e);
+            }
+        }
+    }
+
+    if read_dbs.is_empty() {
+        panic!("No Redis connections available");
+    }
 
     let path = env::var("ARCHIVAL_DATA_PATH").ok();
     let last_block_height = path.as_ref().and_then(last_block_height);
 
-    let (id, _key_values) = read_db
-        .xread(1, &blocks_key, "0")
-        .await
-        .expect("Failed to get the first block from Redis")
-        .into_iter()
-        .next()
-        .unwrap();
-    let first_block_height: BlockHeight = id.split_once("-").unwrap().0.parse().unwrap();
+    let first_block_heights = join_all(
+        read_dbs
+            .iter_mut()
+            .map(|db| first_block_id(db, &blocks_key))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let first_block_height = first_block_heights
+        .iter()
+        .filter_map(|h| *h)
+        .max()
+        .expect("No blocks found in Redis");
+
     let min_start_block =
         (first_block_height + SAFE_OFFSET + save_every_n) / save_every_n * save_every_n;
 
@@ -72,36 +142,39 @@ async fn main() {
         start_block = min_start_block;
     }
 
-    let mut last_id = format!("{}-0", start_block.saturating_sub(1));
-    tracing::info!(target: PROJECT_ID, "Resuming from {}", last_id);
+    let last_processed_block = Arc::new(RwLock::new(start_block.saturating_sub(1)));
+
+    tracing::info!(target: PROJECT_ID, "Resuming from {}", last_processed_block.read().unwrap());
 
     let mut cache_db = if let Some(cache_url) = env::var("CACHE_REDIS_URL").ok() {
         tracing::info!(target: PROJECT_ID, "Connecting to cache redis");
-        Some(RedisDB::new(Some(cache_url)).await)
+        Some(
+            RedisDB::new(Some(cache_url))
+                .await
+                .expect("Failed to connect to cache redis"),
+        )
     } else {
         tracing::info!(target: PROJECT_ID, "No cache redis URL provided");
         None
     };
 
+    let (sender, mut receiver) = mpsc::channel(100);
+    for db in read_dbs {
+        let blocks_key = blocks_key.clone();
+        let sender = sender.clone();
+        let last_processed_block = last_processed_block.clone();
+        tokio::spawn(block_producer(db, blocks_key, sender, last_processed_block));
+    }
+
     let mut last_block_height: BlockHeight = 0;
     let mut blocks = vec![];
-    loop {
-        let res = read_db.xread(1, &blocks_key, &last_id).await;
-        let res = match res {
-            Ok(res) => res,
-            Err(err) => {
-                tracing::error!(target: PROJECT_ID, "Error: {}", err);
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                let _ = read_db.reconnect().await;
-                continue;
-            }
-        };
-        let (id, key_values) = res.into_iter().next().unwrap();
-        assert_eq!(key_values.len(), 1, "Expected 1 key-value pair");
-        let (key, value) = key_values.into_iter().next().unwrap();
-        assert_eq!(key, BLOCK_KEY, "Expected key to be block");
-        let block_height: BlockHeight = id.split_once("-").unwrap().0.parse().unwrap();
-        tracing::info!(target: PROJECT_ID, "Processing block: {}", block_height);
+    while let Some((block_height, value)) = receiver.recv().await {
+        if last_block_height > 0 && block_height <= last_block_height {
+            continue;
+        }
+        tracing::debug!(target: PROJECT_ID, "Processing block: {}", block_height);
+        *last_processed_block.write().unwrap() = block_height;
+
         if blocks.get(0).map(|(height, _block)| *height).unwrap_or(0) / save_every_n
             != block_height / save_every_n
         {
@@ -131,7 +204,6 @@ async fn main() {
         }
 
         blocks.push((block_height, value));
-        last_id = id;
         last_block_height = block_height;
     }
 }
