@@ -52,7 +52,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1.6"
 
-near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "3a32fb3f286ad0493cec84255dadfe548102ecd1" }
+near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "9c20b09a827c7dc5dc1303b1a415659a37ddf6e0" }
 borsh = "1.5.0"
 
 itertools = "0.12.0"
