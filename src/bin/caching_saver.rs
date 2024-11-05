@@ -38,13 +38,7 @@ fn last_block_height(path: &String) -> Option<BlockHeight> {
 }
 
 async fn first_block_id(read_db: &mut RedisDB, blocks_key: &str) -> Option<BlockHeight> {
-    let (id, _key_values) = read_db
-        .xread(1, blocks_key, "0")
-        .await
-        .map_err(|e| tracing::error!(target: PROJECT_ID, "Failed to get the first block from Redis: {}", e))
-        .ok()?
-        .into_iter()
-        .next()?;
+    let id = read_db.first_id(blocks_key).await.ok()??;
     Some(id.split_once("-").unwrap().0.parse().unwrap())
 }
 
@@ -66,6 +60,10 @@ async fn block_producer(
                 continue;
             }
         };
+        if res.is_empty() {
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            continue;
+        }
         let (id, key_values) = res.into_iter().next().unwrap();
         assert_eq!(key_values.len(), 1, "Expected 1 key-value pair");
         let (key, value) = key_values.into_iter().next().unwrap();
