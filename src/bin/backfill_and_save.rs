@@ -2,7 +2,6 @@ mod block_with_tx_hash;
 mod common;
 
 use crate::block_with_tx_hash::BlockWithTxHashes;
-use borsh::BorshDeserialize;
 use dotenv::dotenv;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::BlockHeight;
