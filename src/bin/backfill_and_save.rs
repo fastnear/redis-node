@@ -9,13 +9,14 @@ use near_indexer::near_primitives::types::BlockHeight;
 use near_indexer::streamer::build_streamer_message;
 use near_indexer::streamer::fetchers::fetch_block_by_height;
 use near_indexer::{Indexer, StreamerMessage};
+use std::collections::HashMap;
 use std::time::Duration;
 use std::{env, fs};
 use tokio::sync::mpsc;
 
 const PROJECT_ID: &str = "backfill";
 
-const RECEIPT_BACKFILL_DEPTH: u64 = 100;
+const RECEIPT_BACKFILL_DEPTH: u64 = 250;
 /// The number of blocks of receipts to keep in the cache before we start cleaning up.
 /// It's necessary to keep receipts in memory for longer than one block in order to support
 /// reorgs when streaming optimistic blocks.
@@ -23,41 +24,21 @@ const RECEIPT_HASH_CLEANUP_BLOCKS: u64 = 10;
 
 pub type BlockHashes = Vec<CryptoHash>;
 
+#[derive(Default)]
 pub struct TxCache {
-    pub db: sled::Db,
-}
-
-fn into_crypto_hash(hash: sled::InlineArray) -> CryptoHash {
-    let mut result = CryptoHash::default();
-    result.0.copy_from_slice(&hash);
-    result
+    pub receipt_to_tx: HashMap<CryptoHash, CryptoHash>,
+    pub block_hashes: HashMap<BlockHeight, BlockHashes>,
 }
 
 impl TxCache {
-    pub fn flush(&self) {
-        self.db.flush().expect("Failed to flush");
-    }
-
     pub fn peek_receipt_to_tx(&self, receipt_id: &CryptoHash) -> Option<CryptoHash> {
-        self.db
-            .get(receipt_id)
-            .expect("Failed to remove")
-            .map(into_crypto_hash)
+        self.receipt_to_tx.get(receipt_id).cloned()
     }
 
-    pub fn get_and_remove_receipt_to_tx(&self, receipt_id: &CryptoHash) -> Option<CryptoHash> {
-        self.db
-            .remove(receipt_id)
-            .expect("Failed to remove")
-            .map(into_crypto_hash)
-    }
-
-    pub fn store_receipt_to_tx(&self, receipt_id: &CryptoHash, tx_hash: &CryptoHash) {
+    pub fn store_receipt_to_tx(&mut self, receipt_id: &CryptoHash, tx_hash: &CryptoHash) {
         let old_tx_hash = self
-            .db
-            .insert(receipt_id, tx_hash.0.to_vec())
-            .expect("Failed to insert")
-            .map(into_crypto_hash);
+            .receipt_to_tx
+            .insert(receipt_id.clone(), tx_hash.clone());
 
         if let Some(old_tx_hash) = old_tx_hash {
             assert_eq!(
@@ -69,54 +50,31 @@ impl TxCache {
         }
     }
 
-    pub fn get_last_block_height(&self) -> Option<BlockHeight> {
-        self.db
-            .get("last_block_height")
-            .expect("Failed to get last_block_height")
-            .map(|v| BlockHeight::try_from_slice(&v).expect("Failed to deserialize"))
-    }
-
-    pub fn set_last_block_height(&self, block_height: BlockHeight) {
-        self.db
-            .insert("last_block_height", borsh::to_vec(&block_height).unwrap())
-            .expect("Failed to set last_block_height");
-    }
-
     pub fn set_receipt_hashes_to_remove(
-        &self,
+        &mut self,
         block_height: BlockHeight,
         receipt_hashes: BlockHashes,
     ) {
-        self.db
-            .insert(
-                format!("block_hashes:{}", block_height),
-                borsh::to_vec(&receipt_hashes).unwrap(),
-            )
-            .expect("Failed to set receipt_hashes_to_remove");
+        self.block_hashes.insert(block_height, receipt_hashes);
     }
 
-    pub fn clean_receipt_hashes_to_remove(&self, block_height: BlockHeight) {
-        let v = self
-            .db
-            .remove(format!("block_hashes:{}", block_height))
-            .expect("Failed to clean receipt_hashes_to_remove");
-        if let Some(v) = v {
-            let receipt_hashes: BlockHashes =
-                BorshDeserialize::try_from_slice(&v).expect("Failed to deserialize");
+    pub fn clean_receipt_hashes_to_remove(&mut self, block_height: BlockHeight) {
+        let receipt_hashes = self.block_hashes.remove(&block_height);
+        if let Some(receipt_hashes) = receipt_hashes {
             for receipt_hash in receipt_hashes {
-                self.db
-                    .remove(&receipt_hash)
-                    .expect("Failed to clean receipt_hashes_to_remove");
+                self.receipt_to_tx.remove(&receipt_hash);
             }
         }
     }
 }
 
-fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
+fn process_block(
+    tx_cache: &mut TxCache,
+    block: &mut BlockWithTxHashes,
+    last_block_height: Option<BlockHeight>,
+) -> bool {
     let mut has_all_tx_hashes = true;
     let mut receipt_hashes_to_remove = vec![];
-
-    let last_block_height = tx_cache.get_last_block_height();
     // Extract all tx_hashes first
     for shard in &block.shards {
         if let Some(chunk) = &shard.chunk {
@@ -153,8 +111,6 @@ fn process_block(tx_cache: &TxCache, block: &mut BlockWithTxHashes) -> bool {
             );
         }
     }
-    tx_cache.set_last_block_height(block_height);
-    tx_cache.flush();
 
     has_all_tx_hashes
 }
@@ -165,13 +121,7 @@ fn main() {
 
     let save_every_n: u64 = 10;
 
-    let sled_db_path = "res/sled_db_backfill";
-    if !std::path::Path::new(&sled_db_path).exists() {
-        std::fs::create_dir_all(&sled_db_path)
-            .expect(format!("Failed to create {}", sled_db_path).as_str());
-    }
-    let sled_db = sled::open(&sled_db_path).expect("Failed to open sled_db_path");
-    let tx_cache = TxCache { db: sled_db };
+    let tx_cache = TxCache::default();
 
     let home_dir = std::path::PathBuf::from(near_indexer::get_default_home());
 
@@ -282,19 +232,21 @@ fn save_blocks(
 
 async fn listen_blocks(
     mut stream: mpsc::Receiver<StreamerMessage>,
-    tx_cache: TxCache,
+    mut tx_cache: TxCache,
     save_path: Option<String>,
     save_every_n: u64,
     start_block_height: BlockHeight,
 ) {
     let mut blocks = vec![];
+    let mut last_block_height = None;
 
     while let Some(streamer_message) = stream.recv().await {
         let block_height = streamer_message.block.header.height;
         tracing::info!(target: PROJECT_ID, "Processing block: {}", block_height);
 
         let mut block: BlockWithTxHashes = streamer_message.into();
-        let has_all_tx_hashes = process_block(&tx_cache, &mut block);
+        let has_all_tx_hashes = process_block(&mut tx_cache, &mut block, last_block_height);
+        last_block_height = Some(block_height);
 
         if !has_all_tx_hashes {
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
