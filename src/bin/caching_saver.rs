@@ -6,7 +6,7 @@ use futures::future::join_all;
 use redis::aio::MultiplexedConnection;
 use redis_db::RedisDB;
 use std::sync::{Arc, RwLock};
-use std::{env, fs};
+use std::{env, fs, process};
 use tokio::sync::mpsc;
 
 pub type BlockHeight = u64;
@@ -176,8 +176,9 @@ async fn main() {
         if blocks.get(0).map(|(height, _block)| *height).unwrap_or(0) / save_every_n
             != block_height / save_every_n
         {
-            save_blocks(&blocks, path.as_ref(), save_every_n).unwrap();
-            blocks.clear();
+            let mut new_blocks = vec![];
+            std::mem::swap(&mut blocks, &mut new_blocks);
+            save_blocks_async(new_blocks, path.clone(), save_every_n);
         }
         // Update cache
 
@@ -206,9 +207,23 @@ async fn main() {
     }
 }
 
+fn save_blocks_async(blocks: Vec<(BlockHeight, String)>, path: Option<String>, save_every_n: u64) {
+    if blocks.is_empty() || path.is_none() {
+        return;
+    }
+    tokio::spawn((|| async move {
+        save_blocks(&blocks, path, save_every_n)
+            .map_err(|e| {
+                tracing::error!(target: PROJECT_ID, "Failed to save blocks: {}", e);
+                process::exit(1);
+            })
+            .unwrap();
+    })());
+}
+
 fn save_blocks(
     blocks: &[(BlockHeight, String)],
-    path: Option<&String>,
+    path: Option<String>,
     save_every_n: u64,
 ) -> std::io::Result<()> {
     if blocks.is_empty() || path.is_none() {
