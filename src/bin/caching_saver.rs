@@ -276,7 +276,8 @@ pub(crate) async fn set_block_and_last_block_height(
             .ignore();
     }
 
-    pipe.cmd("SET")
+    let _res: () = pipe
+        .cmd("SET")
         .arg(format!("meta:{}:last_block", chain_id))
         .arg(last_block_height)
         .ignore()
