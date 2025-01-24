@@ -4,6 +4,7 @@ mod redis_db;
 use dotenv::dotenv;
 use futures::future::join_all;
 use redis::aio::MultiplexedConnection;
+use redis::RedisResult;
 use redis_db::RedisDB;
 use std::sync::{Arc, RwLock};
 use std::{env, fs, process};
@@ -274,19 +275,37 @@ pub(crate) async fn set_block_and_last_block_height(
             .arg(CACHE_EXPIRATION.as_secs())
             .ignore();
     }
-    pipe.cmd("XADD")
-        .arg(format!("meta:{}:last_blocks_queue", chain_id))
-        .arg("MAXLEN")
-        .arg("~")
-        .arg(10)
-        .arg(format!("{}-0", last_block_height))
-        .arg(&["a", "b"])
-        .ignore();
 
     pipe.cmd("SET")
         .arg(format!("meta:{}:last_block", chain_id))
         .arg(last_block_height)
         .ignore()
         .query_async(connection)
-        .await
+        .await?;
+
+    let res: RedisResult<redis::Value> = redis::cmd("XADD")
+        .arg(format!("meta:{}:last_blocks_queue", chain_id))
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(10)
+        .arg(format!("{}-0", last_block_height))
+        .arg(&["a", "b"])
+        .query_async(connection)
+        .await;
+
+    match res {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            if err.kind() == redis::ErrorKind::ResponseError
+                && err.to_string().contains(
+                    "The ID specified in XADD is equal or smaller than the target stream top item",
+                )
+            {
+                tracing::log::warn!(target: PROJECT_ID, "Duplicate ID: {}", err);
+                Ok(())
+            } else {
+                Err(err)
+            }
+        }
+    }
 }
