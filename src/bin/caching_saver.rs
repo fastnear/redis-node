@@ -274,6 +274,15 @@ pub(crate) async fn set_block_and_last_block_height(
             .arg(CACHE_EXPIRATION.as_secs())
             .ignore();
     }
+    pipe.cmd("XADD")
+        .arg(format!("meta:{}:last_blocks_queue", chain_id))
+        .arg("MAXLEN")
+        .arg("~")
+        .arg(10)
+        .arg(format!("{}-0", last_block_height))
+        .arg(&["a", "b"])
+        .ignore();
+
     pipe.cmd("SET")
         .arg(format!("meta:{}:last_block", chain_id))
         .arg(last_block_height)
