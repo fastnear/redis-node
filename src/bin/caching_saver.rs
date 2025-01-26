@@ -7,6 +7,7 @@ use redis::aio::MultiplexedConnection;
 use redis::RedisResult;
 use redis_db::RedisDB;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use std::{env, fs, process};
 use tokio::sync::mpsc;
 
@@ -16,7 +17,7 @@ const PROJECT_ID: &str = "saver";
 const SAFE_OFFSET: u64 = 30;
 
 const BLOCK_KEY: &str = "block";
-const CACHE_EXPIRATION: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_CACHE_EXPIRATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn read_folder(path: &String) -> Vec<String> {
     let mut entries: Vec<String> = fs::read_dir(path)
@@ -92,6 +93,11 @@ async fn main() {
         .expect("SAVE_EVERY_N is not set")
         .parse()
         .unwrap();
+
+    let cache_expiration = env::var("CACHE_EXPIRATION")
+        .ok()
+        .map(|s| Duration::from_secs(s.parse::<u64>().unwrap()))
+        .unwrap_or(DEFAULT_CACHE_EXPIRATION);
 
     let chain_id = env::var("CHAIN_ID").expect("CHAIN_ID is not set");
     common::setup_tracing("redis=info,saver=debug");
@@ -197,6 +203,7 @@ async fn main() {
                     &chain_id,
                     block_height,
                     &blocks_to_update,
+                    cache_expiration,
                 )
                 .await
             })
@@ -264,6 +271,7 @@ pub(crate) async fn set_block_and_last_block_height(
     chain_id: &str,
     last_block_height: BlockHeight,
     blocks: &[(BlockHeight, &str)],
+    cache_expiration: Duration,
 ) -> Result<(), redis::RedisError> {
     let mut pipe = redis::pipe();
 
@@ -272,7 +280,7 @@ pub(crate) async fn set_block_and_last_block_height(
             .arg(format!("b:{}:{}", chain_id, block_height))
             .arg(block)
             .arg("EX")
-            .arg(CACHE_EXPIRATION.as_secs())
+            .arg(cache_expiration.as_secs())
             .ignore();
     }
 
