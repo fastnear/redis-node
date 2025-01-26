@@ -7,6 +7,7 @@ use redis::aio::MultiplexedConnection;
 use redis::RedisResult;
 use redis_db::RedisDB;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use std::{env, fs, process};
 use tokio::sync::mpsc;
 
@@ -16,7 +17,7 @@ const PROJECT_ID: &str = "saver";
 const SAFE_OFFSET: u64 = 30;
 
 const BLOCK_KEY: &str = "block";
-const CACHE_EXPIRATION: std::time::Duration = std::time::Duration::from_secs(60);
+const DEFAULT_CACHE_EXPIRATION: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn read_folder(path: &String) -> Vec<String> {
     let mut entries: Vec<String> = fs::read_dir(path)
@@ -40,6 +41,11 @@ fn last_block_height(path: &String) -> Option<BlockHeight> {
 
 async fn first_block_id(read_db: &mut RedisDB, blocks_key: &str) -> Option<BlockHeight> {
     let id = read_db.first_id(blocks_key).await.ok()??;
+    Some(id.split_once("-").unwrap().0.parse().unwrap())
+}
+
+async fn last_block_id(read_db: &mut RedisDB, blocks_key: &str) -> Option<BlockHeight> {
+    let id = read_db.last_id(blocks_key).await.ok()??;
     Some(id.split_once("-").unwrap().0.parse().unwrap())
 }
 
@@ -93,6 +99,11 @@ async fn main() {
         .parse()
         .unwrap();
 
+    let cache_expiration = env::var("CACHE_EXPIRATION")
+        .ok()
+        .map(|s| Duration::from_secs(s.parse::<u64>().unwrap()))
+        .unwrap_or(DEFAULT_CACHE_EXPIRATION);
+
     let chain_id = env::var("CHAIN_ID").expect("CHAIN_ID is not set");
     common::setup_tracing("redis=info,saver=debug");
     let redis_urls: Vec<_> = env::var("REDIS_URL")
@@ -130,11 +141,26 @@ async fn main() {
         .max()
         .expect("No blocks found in Redis");
 
-    let min_start_block =
+    let last_available_block_heights = join_all(
+        read_dbs
+            .iter_mut()
+            .map(|db| last_block_id(db, &blocks_key))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let last_available_block_height = last_available_block_heights
+        .iter()
+        .filter_map(|h| *h)
+        .max()
+        .expect("No blocks found in Redis");
+
+    let min_start_block: BlockHeight =
         (first_block_height + SAFE_OFFSET + save_every_n) / save_every_n * save_every_n;
 
-    let mut start_block =
-        last_block_height.unwrap_or(min_start_block) / save_every_n * save_every_n;
+    let mut start_block = last_block_height
+        .unwrap_or(last_available_block_height.saturating_sub(SAFE_OFFSET))
+        / save_every_n
+        * save_every_n;
 
     if start_block < first_block_height + SAFE_OFFSET {
         tracing::warn!(target: PROJECT_ID, "Start block is too early, resetting to {}", min_start_block);
@@ -197,6 +223,7 @@ async fn main() {
                     &chain_id,
                     block_height,
                     &blocks_to_update,
+                    cache_expiration,
                 )
                 .await
             })
@@ -264,6 +291,7 @@ pub(crate) async fn set_block_and_last_block_height(
     chain_id: &str,
     last_block_height: BlockHeight,
     blocks: &[(BlockHeight, &str)],
+    cache_expiration: Duration,
 ) -> Result<(), redis::RedisError> {
     let mut pipe = redis::pipe();
 
@@ -272,7 +300,7 @@ pub(crate) async fn set_block_and_last_block_height(
             .arg(format!("b:{}:{}", chain_id, block_height))
             .arg(block)
             .arg("EX")
-            .arg(CACHE_EXPIRATION.as_secs())
+            .arg(cache_expiration.as_secs())
             .ignore();
     }
 
