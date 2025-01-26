@@ -44,6 +44,11 @@ async fn first_block_id(read_db: &mut RedisDB, blocks_key: &str) -> Option<Block
     Some(id.split_once("-").unwrap().0.parse().unwrap())
 }
 
+async fn last_block_id(read_db: &mut RedisDB, blocks_key: &str) -> Option<BlockHeight> {
+    let id = read_db.last_id(blocks_key).await.ok()??;
+    Some(id.split_once("-").unwrap().0.parse().unwrap())
+}
+
 async fn block_producer(
     mut redis_db: RedisDB,
     blocks_key: String,
@@ -136,11 +141,26 @@ async fn main() {
         .max()
         .expect("No blocks found in Redis");
 
-    let min_start_block =
+    let last_available_block_heights = join_all(
+        read_dbs
+            .iter_mut()
+            .map(|db| last_block_id(db, &blocks_key))
+            .collect::<Vec<_>>(),
+    )
+    .await;
+    let last_available_block_height = last_available_block_heights
+        .iter()
+        .filter_map(|h| *h)
+        .max()
+        .expect("No blocks found in Redis");
+
+    let min_start_block: BlockHeight =
         (first_block_height + SAFE_OFFSET + save_every_n) / save_every_n * save_every_n;
 
-    let mut start_block =
-        last_block_height.unwrap_or(min_start_block) / save_every_n * save_every_n;
+    let mut start_block = last_block_height
+        .unwrap_or(last_available_block_height.saturating_sub(SAFE_OFFSET))
+        / save_every_n
+        * save_every_n;
 
     if start_block < first_block_height + SAFE_OFFSET {
         tracing::warn!(target: PROJECT_ID, "Start block is too early, resetting to {}", min_start_block);
