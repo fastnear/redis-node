@@ -5,6 +5,7 @@ mod redis_db;
 use crate::block_with_tx_hash::BlockWithTxHashes;
 use dotenv::dotenv;
 use fastnear_neardata_fetcher::fetcher;
+use fastnear_primitives::near_indexer_primitives::views::ReceiptView;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
 use redis_db::RedisDB;
@@ -192,17 +193,19 @@ async fn listen_blocks(
         let block_height = streamer_message.block.header.height;
         tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
         let mut block: BlockWithTxHashes = streamer_message.into();
-        let missing_receipt_hashes = process_block(&mut tx_cache, &mut block, last_block_height);
+        let receipts_with_missing_tx_hashes =
+            process_block(&mut tx_cache, &mut block, last_block_height);
         last_block_height = Some(block_height);
 
-        if !missing_receipt_hashes.is_empty() {
-            let hashes_str = missing_receipt_hashes
+        if !receipts_with_missing_tx_hashes.is_empty() {
+            let hashes_str = receipts_with_missing_tx_hashes
                 .iter()
-                .map(|h| h.to_string())
+                .map(|h| h.receipt_id.to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{}]", block_height, hashes_str);
             if redis_block < block_height {
+                tracing::log::error!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{:?}]", block_height, receipts_with_missing_tx_hashes);
                 panic!(
                     "Block {} is missing some tx hashes for receipts: [{}]",
                     block_height, hashes_str
@@ -256,8 +259,8 @@ fn process_block(
     tx_cache: &mut TxCache,
     block: &mut BlockWithTxHashes,
     last_block_height: Option<BlockHeight>,
-) -> Vec<CryptoHash> {
-    let mut missing_receipt_hashes = vec![];
+) -> Vec<ReceiptView> {
+    let mut receipts_with_missing_tx_hashes = vec![];
     let mut receipt_hashes_to_remove = vec![];
     // Extract all tx_hashes first
     for shard in &block.shards {
@@ -280,7 +283,7 @@ fn process_block(
                     tx_cache.store_receipt_to_tx(receipt_id, &tx_hash);
                 }
             } else {
-                missing_receipt_hashes.push(reo.receipt.receipt_id);
+                receipts_with_missing_tx_hashes.push(reo.receipt.clone());
             }
         }
     }
@@ -296,5 +299,5 @@ fn process_block(
         }
     }
 
-    missing_receipt_hashes
+    receipts_with_missing_tx_hashes
 }
