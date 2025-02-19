@@ -9,7 +9,7 @@ use fastnear_primitives::near_indexer_primitives::views::ReceiptView;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
 use redis_db::RedisDB;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
 
 pub type BlockHashes = Vec<CryptoHash>;
@@ -82,6 +82,16 @@ fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
+    let missing_receipts_whitelist: HashSet<_> = env::var("MISSING_RECEIPTS_WHITELIST")
+        .map(|s| {
+            s.split(',')
+                .map(|s| {
+                    s.parse::<CryptoHash>()
+                        .expect("Failed to parse CryptoHash in MISSING_RECEIPTS_WHITELIST")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let receipt_backfill_depth = env::var("RECEIPT_BACKFILL_DEPTH")
         .map(|s| s.parse().unwrap())
         .unwrap_or(RECEIPT_BACKFILL_DEPTH);
@@ -170,7 +180,15 @@ fn main() {
 
                 let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
                 let stream = indexer.streamer();
-                listen_blocks(stream, db, tx_cache, config, last_redis_block_height).await;
+                listen_blocks(
+                    stream,
+                    db,
+                    tx_cache,
+                    config,
+                    last_redis_block_height,
+                    missing_receipts_whitelist,
+                )
+                .await;
 
                 actix::System::current().stop();
             });
@@ -186,6 +204,7 @@ async fn listen_blocks(
     mut tx_cache: TxCache,
     config: Config,
     last_redis_block_height: Option<BlockHeight>,
+    missing_receipts_whitelist: HashSet<CryptoHash>,
 ) {
     let redis_block = last_redis_block_height.unwrap_or(0);
     let mut last_block_height = None;
@@ -205,11 +224,16 @@ async fn listen_blocks(
                 .join(", ");
             tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{}]", block_height, hashes_str);
             if redis_block < block_height {
-                tracing::log::error!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{:?}]", block_height, receipts_with_missing_tx_hashes);
-                panic!(
-                    "Block {} is missing some tx hashes for receipts: [{}]",
-                    block_height, hashes_str
-                );
+                if receipts_with_missing_tx_hashes
+                    .iter()
+                    .any(|r| !missing_receipts_whitelist.contains(&r.receipt_id))
+                {
+                    tracing::log::error!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{:?}]", block_height, receipts_with_missing_tx_hashes);
+                    panic!(
+                        "Block {} is missing some tx hashes for receipts: [{}]",
+                        block_height, hashes_str
+                    );
+                }
             }
         }
 
