@@ -192,13 +192,21 @@ async fn listen_blocks(
         let block_height = streamer_message.block.header.height;
         tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
         let mut block: BlockWithTxHashes = streamer_message.into();
-        let has_all_tx_hashes = process_block(&mut tx_cache, &mut block, last_block_height);
+        let missing_receipt_hashes = process_block(&mut tx_cache, &mut block, last_block_height);
         last_block_height = Some(block_height);
 
-        if !has_all_tx_hashes {
-            tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
+        if !missing_receipt_hashes.is_empty() {
+            let hashes_str = missing_receipt_hashes
+                .iter()
+                .map(|h| h.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{}]", block_height, hashes_str);
             if redis_block < block_height {
-                panic!("Block {} is missing some tx hashes", block_height);
+                panic!(
+                    "Block {} is missing some tx hashes for receipts: [{}]",
+                    block_height, hashes_str
+                );
             }
         }
 
@@ -248,8 +256,8 @@ fn process_block(
     tx_cache: &mut TxCache,
     block: &mut BlockWithTxHashes,
     last_block_height: Option<BlockHeight>,
-) -> bool {
-    let mut has_all_tx_hashes = true;
+) -> Vec<CryptoHash> {
+    let mut missing_receipt_hashes = vec![];
     let mut receipt_hashes_to_remove = vec![];
     // Extract all tx_hashes first
     for shard in &block.shards {
@@ -272,7 +280,7 @@ fn process_block(
                     tx_cache.store_receipt_to_tx(receipt_id, &tx_hash);
                 }
             } else {
-                has_all_tx_hashes = false;
+                missing_receipt_hashes.push(reo.receipt.receipt_id);
             }
         }
     }
@@ -288,5 +296,5 @@ fn process_block(
         }
     }
 
-    has_all_tx_hashes
+    missing_receipt_hashes
 }
