@@ -63,8 +63,8 @@ redis = { version = "0.26.0", features = ["tokio-comp", "tokio-native-tls-comp",
 tar = "0.4"
 flate2 = "1.0"
 
-fastnear-primitives = { git = "https://github.com/fastnear/libs", rev = "a7334b713815011ace7231aca180369fffb2b123" }
-fastnear-neardata-fetcher = { git = "https://github.com/fastnear/libs", rev = "a7334b713815011ace7231aca180369fffb2b123" }
+fastnear-primitives = { git = "https://github.com/fastnear/libs", rev = "45e15ed882055f375ae6e49a48ba36bab29ae084" }
+fastnear-neardata-fetcher = { git = "https://github.com/fastnear/libs", rev = "45e15ed882055f375ae6e49a48ba36bab29ae084" }
 reqwest = { version = "0.12", features = ["json"] }
 
 [profile.release]
