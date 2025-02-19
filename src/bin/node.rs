@@ -81,6 +81,9 @@ fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
+    let receipt_backfill_depth = env::var("RECEIPT_BACKFILL_DEPTH")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(RECEIPT_BACKFILL_DEPTH);
     let finality: Finality =
         serde_json::from_str(&env::var("FINALITY").expect("Missing FINALITY env var"))
             .expect("Failed to parse Finality");
@@ -123,11 +126,11 @@ fn main() {
                     let next_block = last_redis_block_height + 1;
                     if last_tx_cache_block > next_block {
                         // Have to backfill
-                        near_indexer::SyncModeEnum::BlockHeight(next_block - RECEIPT_BACKFILL_DEPTH)
+                        near_indexer::SyncModeEnum::BlockHeight(next_block - receipt_backfill_depth)
                     } else {
                         // Backfill or catch up
                         near_indexer::SyncModeEnum::BlockHeight(
-                            last_tx_cache_block.max(next_block - RECEIPT_BACKFILL_DEPTH),
+                            last_tx_cache_block.max(next_block - receipt_backfill_depth),
                         )
                     }
                 } else if env::var("START_BLOCK").is_ok() {
@@ -135,7 +138,7 @@ fn main() {
                         env::var("START_BLOCK").unwrap().parse().unwrap();
                     last_redis_block_height = Some(start_block_height - 1);
                     near_indexer::SyncModeEnum::BlockHeight(
-                        start_block_height - RECEIPT_BACKFILL_DEPTH - 1,
+                        start_block_height - receipt_backfill_depth - 1,
                     )
                 } else {
                     let client = reqwest::Client::new();
@@ -151,7 +154,7 @@ fn main() {
                         .height;
                     last_redis_block_height = Some(last_block_height - EMPTY_REDIS_DEPTH);
                     near_indexer::SyncModeEnum::BlockHeight(
-                        last_redis_block_height.clone().unwrap() - RECEIPT_BACKFILL_DEPTH - 1,
+                        last_redis_block_height.clone().unwrap() - receipt_backfill_depth - 1,
                     )
                 };
 
