@@ -1,6 +1,6 @@
 [package]
 name = "redis-node"
-version = "0.7.10"
+version = "0.7.11"
 authors = ["Eugene The Dream"]
 rust-version = "1.84.0"
 edition = "2021"

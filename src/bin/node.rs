@@ -78,6 +78,21 @@ impl TxCache {
     }
 }
 
+async fn last_neardata_block_height() -> BlockHeight {
+    let client = reqwest::Client::new();
+    let chain_id = fastnear_primitives::types::ChainId::try_from(
+        env::var("CHAIN_ID").expect("CHAIN_ID is not set"),
+    )
+    .expect("Invalid chain id");
+    let last_block_height = fetcher::fetch_last_block(&client, chain_id)
+        .await
+        .expect("Last block doesn't exists")
+        .block
+        .header
+        .height;
+    last_block_height
+}
+
 fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
@@ -119,8 +134,10 @@ fn main() {
             == "true",
         max_num_blocks: env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok(),
         blocks_key,
-        finality,
+        finality: finality.clone(),
     };
+
+    let start_block: Option<BlockHeight> = env::var("START_BLOCK").ok().map(|s| s.parse().unwrap());
 
     match command {
         "run" => {
@@ -128,44 +145,27 @@ fn main() {
             sys.block_on(async move {
                 let mut db = RedisDB::new(None).await.unwrap();
                 let last_id = db.last_id(&config.blocks_key).await.unwrap();
-                let last_tx_cache_block = 0;
                 let mut last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
-                let sync_mode = if let Some(last_redis_block_height) = last_redis_block_height {
-                    // There is data in the redis. We need to stream closer to this height.
-                    let next_block = last_redis_block_height + 1;
-                    if last_tx_cache_block > next_block {
-                        // Have to backfill
-                        near_indexer::SyncModeEnum::BlockHeight(next_block - receipt_backfill_depth)
-                    } else {
-                        // Backfill or catch up
-                        near_indexer::SyncModeEnum::BlockHeight(
-                            last_tx_cache_block.max(next_block - receipt_backfill_depth),
-                        )
-                    }
-                } else if env::var("START_BLOCK").is_ok() {
-                    let start_block_height: BlockHeight =
-                        env::var("START_BLOCK").unwrap().parse().unwrap();
-                    last_redis_block_height = Some(start_block_height - 1);
-                    near_indexer::SyncModeEnum::BlockHeight(
-                        start_block_height - receipt_backfill_depth - 1,
-                    )
-                } else {
-                    let client = reqwest::Client::new();
-                    let chain_id = fastnear_primitives::types::ChainId::try_from(
-                        env::var("CHAIN_ID").expect("CHAIN_ID is not set"),
-                    )
-                    .expect("Invalid chain id");
-                    let last_block_height = fetcher::fetch_last_block(&client, chain_id)
-                        .await
-                        .expect("Last block doesn't exists")
-                        .block
-                        .header
-                        .height;
+                let sync_mode = if finality == Finality::None
+                    || (start_block.is_none() && last_redis_block_height.is_none())
+                {
+                    // We are in optimistic mode, we need to stream closer to the last block in the redis.
+                    let last_block_height = last_neardata_block_height().await;
                     last_redis_block_height = Some(last_block_height - EMPTY_REDIS_DEPTH);
                     near_indexer::SyncModeEnum::BlockHeight(
                         last_redis_block_height.clone().unwrap() - receipt_backfill_depth - 1,
+                    )
+                } else if let Some(last_redis_block_height) = last_redis_block_height {
+                    near_indexer::SyncModeEnum::BlockHeight(
+                        last_redis_block_height + 1 - receipt_backfill_depth,
+                    )
+                } else {
+                    let start_block_height: BlockHeight = start_block.unwrap();
+                    last_redis_block_height = Some(start_block_height - 1);
+                    near_indexer::SyncModeEnum::BlockHeight(
+                        start_block_height - receipt_backfill_depth - 1,
                     )
                 };
 
