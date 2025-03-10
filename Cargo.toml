@@ -1,6 +1,6 @@
 [package]
 name = "redis-node"
-version = "0.7.11"
+version = "0.7.12"
 authors = ["Eugene The Dream"]
 rust-version = "1.84.0"
 edition = "2021"
@@ -52,7 +52,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1.6"
 
-near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "86569dca0118c17dd685da4ea3ef01284e585651" }
+near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "f159d48cabf18184cd0e1e6fa3a239512704ada6" }
 borsh = "1.5.0"
 
 itertools = "0.12.0"
@@ -63,8 +63,8 @@ redis = { version = "0.26.0", features = ["tokio-comp", "tokio-native-tls-comp",
 tar = "0.4"
 flate2 = "1.0"
 
-fastnear-primitives = { git = "https://github.com/fastnear/libs", rev = "45e15ed882055f375ae6e49a48ba36bab29ae084" }
-fastnear-neardata-fetcher = { git = "https://github.com/fastnear/libs", rev = "45e15ed882055f375ae6e49a48ba36bab29ae084" }
+fastnear-primitives = "0.2.0"
+fastnear-neardata-fetcher = "0.2.0"
 reqwest = { version = "0.12", features = ["json"] }
 
 [profile.release]
