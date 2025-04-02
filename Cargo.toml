@@ -1,6 +1,6 @@
 [package]
 name = "redis-node"
-version = "0.7.12"
+version = "0.7.13"
 authors = ["Eugene The Dream"]
 rust-version = "1.84.0"
 edition = "2021"
@@ -52,7 +52,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1.6"
 
-near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "f159d48cabf18184cd0e1e6fa3a239512704ada6" }
+near-indexer = { git = "https://github.com/fastnear/nearcore", rev = "b033955af84450ac5b4b99f9c47193ae50f01ea7" }
 borsh = "1.5.0"
 
 itertools = "0.12.0"
