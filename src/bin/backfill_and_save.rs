@@ -170,7 +170,8 @@ async fn start(
     for block_height in start_block_height - RECEIPT_BACKFILL_DEPTH..end_block_height {
         let block = fetch_block_by_height(&view_client, block_height).await;
         if let Ok(block) = block {
-            let response = build_streamer_message(&view_client, block).await;
+            let response =
+                build_streamer_message(&view_client, block, &indexer.shard_tracker).await;
             if let Ok(response) = response {
                 block_sink.send(response).await.unwrap();
             } else {
