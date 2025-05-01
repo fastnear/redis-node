@@ -21,6 +21,7 @@ const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
 const RECEIPT_BACKFILL_DEPTH: u64 = 250;
 const EMPTY_REDIS_DEPTH: u64 = 1000;
+const OPTIMISTIC_DEPTH: u64 = 10;
 
 /// The number of blocks of receipts to keep in the cache before we start cleaning up.
 /// It's necessary to keep receipts in memory for longer than one block in order to support
@@ -153,7 +154,12 @@ fn main() {
                 {
                     // We are in optimistic mode, we need to stream closer to the last block in the redis.
                     let last_block_height = last_neardata_block_height().await;
-                    last_redis_block_height = Some(last_block_height - EMPTY_REDIS_DEPTH);
+                    let empty_redis_depth = if finality == Finality::None {
+                        OPTIMISTIC_DEPTH
+                    } else {
+                        EMPTY_REDIS_DEPTH
+                    };
+                    last_redis_block_height = Some(last_block_height - empty_redis_depth);
                     near_indexer::SyncModeEnum::BlockHeight(
                         last_redis_block_height.clone().unwrap() - receipt_backfill_depth - 1,
                     )
