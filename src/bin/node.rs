@@ -210,7 +210,13 @@ async fn listen_blocks(
     let mut last_block_height = None;
     while let Some(streamer_message) = stream.recv().await {
         let block_height = streamer_message.block.header.height;
-        tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
+        let block_timestamp = streamer_message.block.header.timestamp;
+        let current_time_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let time_diff_ns = current_time_ns.saturating_sub(block_timestamp);
+        tracing::log::info!(target: PROJECT_ID, "Processing block\t{}\t\tlatency {:3f}", block_height, time_diff_ns as f64 / 1e9f64);
         let mut block: BlockWithTxHashes = streamer_message.into();
         let receipts_with_missing_tx_hashes =
             process_block(&mut tx_cache, &mut block, last_block_height);
