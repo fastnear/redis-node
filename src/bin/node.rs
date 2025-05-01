@@ -216,7 +216,7 @@ async fn listen_blocks(
             .unwrap()
             .as_nanos() as u64;
         let time_diff_ns = current_time_ns.saturating_sub(block_timestamp);
-        tracing::log::info!(target: PROJECT_ID, "Processing block\t{}\t\tlatency {:.3}", block_height, time_diff_ns as f64 / 1e9f64);
+        tracing::log::info!(target: PROJECT_ID, "Processing block{}\tlatency {:.3} sec", block_height, time_diff_ns as f64 / 1e9f64);
         let mut block: BlockWithTxHashes = streamer_message.into();
         let receipts_with_missing_tx_hashes =
             process_block(&mut tx_cache, &mut block, last_block_height);
