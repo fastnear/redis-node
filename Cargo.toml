@@ -63,8 +63,8 @@ redis = { version = "0.26.0", features = ["tokio-comp", "tokio-native-tls-comp",
 tar = "0.4"
 flate2 = "1.0"
 
-fastnear-primitives = "0.2.0"
-fastnear-neardata-fetcher = "0.2.0"
+fastnear-primitives = "0.3.1"
+fastnear-neardata-fetcher = "0.3.1"
 reqwest = { version = "0.12", features = ["json"] }
 
 [profile.release]
