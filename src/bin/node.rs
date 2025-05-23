@@ -1,3 +1,4 @@
+use std::io::Write;
 mod block_with_tx_hash;
 mod common;
 mod redis_db;
@@ -5,12 +6,14 @@ mod redis_db;
 use crate::block_with_tx_hash::BlockWithTxHashes;
 use dotenv::dotenv;
 use fastnear_neardata_fetcher::fetcher;
+use fastnear_primitives::near_primitives::hash::hash;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
 use near_indexer::near_primitives::views::ReceiptView;
 use redis_db::RedisDB;
 use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs::{create_dir_all, File, OpenOptions};
 
 pub type BlockHashes = Vec<CryptoHash>;
 
@@ -33,6 +36,7 @@ pub struct Config {
     pub max_num_blocks: Option<usize>,
     pub blocks_key: String,
     pub finality: Finality,
+    pub log_file: File,
 }
 
 #[derive(Default)]
@@ -130,12 +134,21 @@ fn main() {
         .map(|arg| arg.as_str())
         .expect("You need to provide a command: `init` or `run` as arg");
 
+    // Create or append file
+    create_dir_all("res").expect("Failed to create res directory");
+    let log_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open("res/blocks_log.csv")
+        .expect("Failed to create a log file");
+
     let config = Config {
         stream_to_redis: env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var")
             == "true",
         max_num_blocks: env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok(),
         blocks_key,
         finality: finality.clone(),
+        log_file,
     };
 
     let start_block: Option<BlockHeight> = env::var("START_BLOCK").ok().map(|s| s.parse().unwrap());
@@ -208,7 +221,7 @@ async fn listen_blocks(
     mut stream: tokio::sync::mpsc::Receiver<near_indexer::StreamerMessage>,
     mut db: RedisDB,
     mut tx_cache: TxCache,
-    config: Config,
+    mut config: Config,
     last_redis_block_height: Option<BlockHeight>,
     missing_receipts_whitelist: HashSet<CryptoHash>,
 ) {
@@ -253,10 +266,18 @@ async fn listen_blocks(
             continue;
         }
 
-        let data = vec![(
-            BLOCK_KEY.to_string(),
-            serde_json::to_string(&block).unwrap(),
-        )];
+        let serialized_block = serde_json::to_string(&block).unwrap();
+        let block_size = serialized_block.len();
+        let block_local_hash = hash(serialized_block.as_bytes());
+        let block_hash = block.block.header.hash;
+        writeln!(
+            config.log_file,
+            "{:?},{},{},{},{}",
+            config.finality, block_height, block_hash, block_local_hash, block_size
+        )
+        .expect("Failed to write to log file");
+
+        let data = vec![(BLOCK_KEY.to_string(), serialized_block)];
 
         let id = format!("{}-0", block_height);
 
