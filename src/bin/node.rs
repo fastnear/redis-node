@@ -137,8 +137,8 @@ fn main() {
     // Create or append file
     create_dir_all("res").expect("Failed to create res directory");
     let log_file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
+        .create(true)
+        .append(true)
         .open("res/blocks_log.csv")
         .expect("Failed to create a log file");
 
