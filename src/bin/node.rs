@@ -1,3 +1,4 @@
+use std::io::Write;
 mod block_with_tx_hash;
 mod common;
 mod redis_db;
@@ -5,11 +6,14 @@ mod redis_db;
 use crate::block_with_tx_hash::BlockWithTxHashes;
 use dotenv::dotenv;
 use fastnear_neardata_fetcher::fetcher;
+use fastnear_primitives::near_primitives::hash::hash;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
+use near_indexer::near_primitives::views::ReceiptView;
 use redis_db::RedisDB;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::env;
+use std::fs::{create_dir_all, File, OpenOptions};
 
 pub type BlockHashes = Vec<CryptoHash>;
 
@@ -20,6 +24,7 @@ const MAX_RETRIES: usize = 10;
 const INITIAL_RETRY_DELAY: u64 = 100;
 const RECEIPT_BACKFILL_DEPTH: u64 = 250;
 const EMPTY_REDIS_DEPTH: u64 = 1000;
+const OPTIMISTIC_DEPTH: u64 = 10;
 
 /// The number of blocks of receipts to keep in the cache before we start cleaning up.
 /// It's necessary to keep receipts in memory for longer than one block in order to support
@@ -31,6 +36,7 @@ pub struct Config {
     pub max_num_blocks: Option<usize>,
     pub blocks_key: String,
     pub finality: Finality,
+    pub log_file: File,
 }
 
 #[derive(Default)]
@@ -77,10 +83,38 @@ impl TxCache {
     }
 }
 
+async fn last_neardata_block_height() -> BlockHeight {
+    let client = reqwest::Client::new();
+    let chain_id = fastnear_primitives::types::ChainId::try_from(
+        env::var("CHAIN_ID").expect("CHAIN_ID is not set"),
+    )
+    .expect("Invalid chain id");
+    let last_block_height = fetcher::fetch_last_block(&client, chain_id)
+        .await
+        .expect("Last block doesn't exists")
+        .block
+        .header
+        .height;
+    last_block_height
+}
+
 fn main() {
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
+    let missing_receipts_whitelist: HashSet<_> = env::var("MISSING_RECEIPTS_WHITELIST")
+        .map(|s| {
+            s.split(',')
+                .map(|s| {
+                    s.parse::<CryptoHash>()
+                        .expect("Failed to parse CryptoHash in MISSING_RECEIPTS_WHITELIST")
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let receipt_backfill_depth = env::var("RECEIPT_BACKFILL_DEPTH")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(RECEIPT_BACKFILL_DEPTH);
     let finality: Finality =
         serde_json::from_str(&env::var("FINALITY").expect("Missing FINALITY env var"))
             .expect("Failed to parse Finality");
@@ -100,13 +134,24 @@ fn main() {
         .map(|arg| arg.as_str())
         .expect("You need to provide a command: `init` or `run` as arg");
 
+    // Create or append file
+    create_dir_all("res").expect("Failed to create res directory");
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("res/blocks_log.csv")
+        .expect("Failed to create a log file");
+
     let config = Config {
         stream_to_redis: env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var")
             == "true",
         max_num_blocks: env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok(),
         blocks_key,
-        finality,
+        finality: finality.clone(),
+        log_file,
     };
+
+    let start_block: Option<BlockHeight> = env::var("START_BLOCK").ok().map(|s| s.parse().unwrap());
 
     match command {
         "run" => {
@@ -114,44 +159,32 @@ fn main() {
             sys.block_on(async move {
                 let mut db = RedisDB::new(None).await.unwrap();
                 let last_id = db.last_id(&config.blocks_key).await.unwrap();
-                let last_tx_cache_block = 0;
                 let mut last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
-                let sync_mode = if let Some(last_redis_block_height) = last_redis_block_height {
-                    // There is data in the redis. We need to stream closer to this height.
-                    let next_block = last_redis_block_height + 1;
-                    if last_tx_cache_block > next_block {
-                        // Have to backfill
-                        near_indexer::SyncModeEnum::BlockHeight(next_block - RECEIPT_BACKFILL_DEPTH)
+                let sync_mode = if finality == Finality::None
+                    || (start_block.is_none() && last_redis_block_height.is_none())
+                {
+                    // We are in optimistic mode, we need to stream closer to the last block in the redis.
+                    let last_block_height = last_neardata_block_height().await;
+                    let empty_redis_depth = if finality == Finality::None {
+                        OPTIMISTIC_DEPTH
                     } else {
-                        // Backfill or catch up
-                        near_indexer::SyncModeEnum::BlockHeight(
-                            last_tx_cache_block.max(next_block - RECEIPT_BACKFILL_DEPTH),
-                        )
-                    }
-                } else if env::var("START_BLOCK").is_ok() {
-                    let start_block_height: BlockHeight =
-                        env::var("START_BLOCK").unwrap().parse().unwrap();
-                    last_redis_block_height = Some(start_block_height - 1);
+                        EMPTY_REDIS_DEPTH
+                    };
+                    last_redis_block_height = Some(last_block_height - empty_redis_depth);
                     near_indexer::SyncModeEnum::BlockHeight(
-                        start_block_height - RECEIPT_BACKFILL_DEPTH - 1,
+                        last_redis_block_height.clone().unwrap() - receipt_backfill_depth - 1,
+                    )
+                } else if let Some(last_redis_block_height) = last_redis_block_height {
+                    near_indexer::SyncModeEnum::BlockHeight(
+                        last_redis_block_height + 1 - receipt_backfill_depth,
                     )
                 } else {
-                    let client = reqwest::Client::new();
-                    let chain_id = fastnear_primitives::types::ChainId::try_from(
-                        env::var("CHAIN_ID").expect("CHAIN_ID is not set"),
-                    )
-                    .expect("Invalid chain id");
-                    let last_block_height = fetcher::fetch_last_block(&client, chain_id)
-                        .await
-                        .expect("Last block doesn't exists")
-                        .block
-                        .header
-                        .height;
-                    last_redis_block_height = Some(last_block_height - EMPTY_REDIS_DEPTH);
+                    let start_block_height: BlockHeight = start_block.unwrap();
+                    last_redis_block_height = Some(start_block_height - 1);
                     near_indexer::SyncModeEnum::BlockHeight(
-                        last_redis_block_height.clone().unwrap() - RECEIPT_BACKFILL_DEPTH - 1,
+                        start_block_height - receipt_backfill_depth - 1,
                     )
                 };
 
@@ -166,7 +199,15 @@ fn main() {
 
                 let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
                 let stream = indexer.streamer();
-                listen_blocks(stream, db, tx_cache, config, last_redis_block_height).await;
+                listen_blocks(
+                    stream,
+                    db,
+                    tx_cache,
+                    config,
+                    last_redis_block_height,
+                    missing_receipts_whitelist,
+                )
+                .await;
 
                 actix::System::current().stop();
             });
@@ -180,22 +221,44 @@ async fn listen_blocks(
     mut stream: tokio::sync::mpsc::Receiver<near_indexer::StreamerMessage>,
     mut db: RedisDB,
     mut tx_cache: TxCache,
-    config: Config,
+    mut config: Config,
     last_redis_block_height: Option<BlockHeight>,
+    missing_receipts_whitelist: HashSet<CryptoHash>,
 ) {
     let redis_block = last_redis_block_height.unwrap_or(0);
     let mut last_block_height = None;
     while let Some(streamer_message) = stream.recv().await {
         let block_height = streamer_message.block.header.height;
-        tracing::log::info!(target: PROJECT_ID, "Processing block {}", block_height);
+        let block_timestamp = streamer_message.block.header.timestamp;
+        let current_time_ns = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64;
+        let time_diff_ns = current_time_ns.saturating_sub(block_timestamp);
+        tracing::log::info!(target: PROJECT_ID, "Processing block {}\tlatency {:.3} sec", block_height, time_diff_ns as f64 / 1e9f64);
         let mut block: BlockWithTxHashes = streamer_message.into();
-        let has_all_tx_hashes = process_block(&mut tx_cache, &mut block, last_block_height);
+        let receipts_with_missing_tx_hashes =
+            process_block(&mut tx_cache, &mut block, last_block_height);
         last_block_height = Some(block_height);
 
-        if !has_all_tx_hashes {
-            tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes", block_height);
+        if !receipts_with_missing_tx_hashes.is_empty() {
+            let hashes_str = receipts_with_missing_tx_hashes
+                .iter()
+                .map(|h| h.receipt_id.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{}]", block_height, hashes_str);
             if redis_block < block_height {
-                panic!("Block {} is missing some tx hashes", block_height);
+                if receipts_with_missing_tx_hashes
+                    .iter()
+                    .any(|r| !missing_receipts_whitelist.contains(&r.receipt_id))
+                {
+                    tracing::log::error!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{:?}]", block_height, receipts_with_missing_tx_hashes);
+                    panic!(
+                        "Block {} is missing some tx hashes for receipts: [{}]",
+                        block_height, hashes_str
+                    );
+                }
             }
         }
 
@@ -203,10 +266,18 @@ async fn listen_blocks(
             continue;
         }
 
-        let data = vec![(
-            BLOCK_KEY.to_string(),
-            serde_json::to_string(&block).unwrap(),
-        )];
+        let serialized_block = serde_json::to_string(&block).unwrap();
+        let block_size = serialized_block.len();
+        let block_local_hash = hash(serialized_block.as_bytes());
+        let block_hash = block.block.header.hash;
+        writeln!(
+            config.log_file,
+            "{:?},{},{},{},{}",
+            config.finality, block_height, block_hash, block_local_hash, block_size
+        )
+        .expect("Failed to write to log file");
+
+        let data = vec![(BLOCK_KEY.to_string(), serialized_block)];
 
         let id = format!("{}-0", block_height);
 
@@ -245,8 +316,8 @@ fn process_block(
     tx_cache: &mut TxCache,
     block: &mut BlockWithTxHashes,
     last_block_height: Option<BlockHeight>,
-) -> bool {
-    let mut has_all_tx_hashes = true;
+) -> Vec<ReceiptView> {
+    let mut receipts_with_missing_tx_hashes = vec![];
     let mut receipt_hashes_to_remove = vec![];
     // Extract all tx_hashes first
     for shard in &block.shards {
@@ -269,7 +340,7 @@ fn process_block(
                     tx_cache.store_receipt_to_tx(receipt_id, &tx_hash);
                 }
             } else {
-                has_all_tx_hashes = false;
+                receipts_with_missing_tx_hashes.push(reo.receipt.clone());
             }
         }
     }
@@ -285,5 +356,5 @@ fn process_block(
         }
     }
 
-    has_all_tx_hashes
+    receipts_with_missing_tx_hashes
 }
