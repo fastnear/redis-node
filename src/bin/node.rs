@@ -166,6 +166,7 @@ fn main() {
                     || (start_block.is_none() && last_redis_block_height.is_none())
                 {
                     // We are in optimistic mode, we need to stream closer to the last block in the redis.
+                    tracing::log::info!(target: PROJECT_ID, "We are in optimistic mode or last_redis_block_height is none.");
                     let last_block_height = last_neardata_block_height().await;
                     let empty_redis_depth = if finality == Finality::None {
                         OPTIMISTIC_DEPTH
@@ -177,17 +178,21 @@ fn main() {
                         last_redis_block_height.clone().unwrap() - receipt_backfill_depth - 1,
                     )
                 } else if let Some(last_redis_block_height) = last_redis_block_height {
+                    tracing::log::info!(target: PROJECT_ID, "last_redis_block_height {}", last_redis_block_height);
                     near_indexer::SyncModeEnum::BlockHeight(
                         last_redis_block_height + 1 - receipt_backfill_depth,
                     )
                 } else {
                     let start_block_height: BlockHeight = start_block.unwrap();
+                    tracing::log::info!(target: PROJECT_ID, "start_block_height {}", start_block_height);
                     last_redis_block_height = Some(start_block_height - 1);
                     near_indexer::SyncModeEnum::BlockHeight(
                         start_block_height - receipt_backfill_depth - 1,
                     )
                 };
 
+                tracing::log::info!(target: PROJECT_ID, "Redis at block height: {:?}", last_redis_block_height);
+                tracing::log::info!(target: PROJECT_ID, "SyncMode: {:?}", sync_mode);                
                 let indexer_config = near_indexer::IndexerConfig {
                     home_dir,
                     sync_mode,
