@@ -208,7 +208,7 @@ fn main() {
                     config,
                     expected_block_height,
                     last_redis_block_height,
-                    missing_receipts_whitelist,
+                    missing_receipts_whitelist
                 )
                     .await;
 
@@ -246,15 +246,22 @@ async fn listen_blocks(
         expected_block_height = block_height + 1;
         let prev_block_hash = streamer_message.block.header.prev_hash;
         if let Some(last_block_hash) = last_block_hash {
-            assert_eq!(
-                last_block_hash, prev_block_hash,
-                "Block hashes don't match at block height: {}. Last block height {:?}, prev block height {:?}. Expected: {}, got: {}",
-                block_height,
-                last_block_height,
-                prev_block_height,
-                last_block_hash,
-                prev_block_hash
-            );
+            if last_block_hash != prev_block_hash {
+                let message = format!(
+                    "Block hashes don't match at block height: {}. Last block height {:?}, prev block height {:?}. Expected: {}, got: {}",
+                    block_height,
+                    last_block_height,
+                    prev_block_height,
+                    last_block_hash,
+                    prev_block_hash
+                );
+                if config.finality == Finality::None {
+                    tracing::log::warn!(target: PROJECT_ID, "{}", message);
+                } else {
+                    tracing::log::error!(target: PROJECT_ID, "{}", message);
+                    panic!("{}", message);
+                }
+            }
         }
         last_block_hash = Some(streamer_message.block.header.hash);
         let block_timestamp = streamer_message.block.header.timestamp;
