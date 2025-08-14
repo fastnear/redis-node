@@ -162,10 +162,11 @@ fn main() {
                 let mut last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
-                let sync_mode = if finality == Finality::None
+                let expected_block_height = if finality == Finality::None
                     || (start_block.is_none() && last_redis_block_height.is_none())
                 {
                     // We are in optimistic mode, we need to stream closer to the last block in the redis.
+                    tracing::log::info!(target: PROJECT_ID, "We are in optimistic mode or last_redis_block_height is none.");
                     let last_block_height = last_neardata_block_height().await;
                     let empty_redis_depth = if finality == Finality::None {
                         OPTIMISTIC_DEPTH
@@ -173,21 +174,22 @@ fn main() {
                         EMPTY_REDIS_DEPTH
                     };
                     last_redis_block_height = Some(last_block_height - empty_redis_depth);
-                    near_indexer::SyncModeEnum::BlockHeight(
-                        last_redis_block_height.clone().unwrap() - receipt_backfill_depth - 1,
-                    )
+                    last_redis_block_height.clone().unwrap() - receipt_backfill_depth - 1
                 } else if let Some(last_redis_block_height) = last_redis_block_height {
-                    near_indexer::SyncModeEnum::BlockHeight(
-                        last_redis_block_height + 1 - receipt_backfill_depth,
-                    )
+                    tracing::log::info!(target: PROJECT_ID, "last_redis_block_height {}", last_redis_block_height);
+                    last_redis_block_height + 1 - receipt_backfill_depth
                 } else {
                     let start_block_height: BlockHeight = start_block.unwrap();
+                    tracing::log::info!(target: PROJECT_ID, "start_block_height {}", start_block_height);
                     last_redis_block_height = Some(start_block_height - 1);
-                    near_indexer::SyncModeEnum::BlockHeight(
-                        start_block_height - receipt_backfill_depth - 1,
-                    )
+
+                    start_block_height - receipt_backfill_depth - 1
                 };
 
+
+                let sync_mode = near_indexer::SyncModeEnum::BlockHeight(expected_block_height);
+                tracing::log::info!(target: PROJECT_ID, "Redis at block height: {:?}", last_redis_block_height);
+                tracing::log::info!(target: PROJECT_ID, "SyncMode: {:?}", sync_mode);
                 let indexer_config = near_indexer::IndexerConfig {
                     home_dir,
                     sync_mode,
@@ -204,10 +206,11 @@ fn main() {
                     db,
                     tx_cache,
                     config,
+                    expected_block_height,
                     last_redis_block_height,
-                    missing_receipts_whitelist,
+                    missing_receipts_whitelist
                 )
-                .await;
+                    .await;
 
                 actix::System::current().stop();
             });
@@ -222,13 +225,45 @@ async fn listen_blocks(
     mut db: RedisDB,
     mut tx_cache: TxCache,
     mut config: Config,
+    mut expected_block_height: BlockHeight,
     last_redis_block_height: Option<BlockHeight>,
     missing_receipts_whitelist: HashSet<CryptoHash>,
 ) {
     let redis_block = last_redis_block_height.unwrap_or(0);
     let mut last_block_height = None;
+    let mut last_block_hash = None;
     while let Some(streamer_message) = stream.recv().await {
         let block_height = streamer_message.block.header.height;
+        let prev_block_height = streamer_message.block.header.prev_height;
+        if let Some(prev_block_height) = prev_block_height {
+            assert!(
+                expected_block_height > prev_block_height,
+                "The indexer skipped a block. Expected block height: {}, but got: {}",
+                expected_block_height,
+                prev_block_height
+            );
+        }
+        expected_block_height = block_height + 1;
+        let prev_block_hash = streamer_message.block.header.prev_hash;
+        if let Some(last_block_hash) = last_block_hash {
+            if last_block_hash != prev_block_hash {
+                let message = format!(
+                    "Block hashes don't match at block height: {}. Last block height {:?}, prev block height {:?}. Expected: {}, got: {}",
+                    block_height,
+                    last_block_height,
+                    prev_block_height,
+                    last_block_hash,
+                    prev_block_hash
+                );
+                if config.finality == Finality::None {
+                    tracing::log::warn!(target: PROJECT_ID, "{}", message);
+                } else {
+                    tracing::log::error!(target: PROJECT_ID, "{}", message);
+                    panic!("{}", message);
+                }
+            }
+        }
+        last_block_hash = Some(streamer_message.block.header.hash);
         let block_timestamp = streamer_message.block.header.timestamp;
         let current_time_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
