@@ -62,8 +62,16 @@ async fn block_producer(
             Ok(res) => res,
             Err(err) => {
                 tracing::error!(target: PROJECT_ID, "Error: {}", err);
-                tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                let _ = redis_db.reconnect().await;
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                    let res = redis_db.reconnect().await;
+                    match res {
+                        Ok(_) => break,
+                        Err(err) => {
+                            tracing::error!(target: PROJECT_ID, "Reconnect error: {}", err);
+                        }
+                    }
+                }
                 continue;
             }
         };
