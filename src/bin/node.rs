@@ -99,6 +99,7 @@ async fn last_neardata_block_height() -> BlockHeight {
 }
 
 fn main() {
+    #[allow(deprecated)]
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
