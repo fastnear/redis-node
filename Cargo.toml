@@ -25,6 +25,7 @@ actix-tls = "3.0.0"
 actix-rt = "2.2.0"
 bigdecimal = "=0.1.0"
 anyhow = "1.0.51"
+home = "=0.5.11"
 
 openssl-probe = { version = "0.1.5" }
 futures = "0.3"
