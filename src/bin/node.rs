@@ -1,15 +1,14 @@
 use std::io::Write;
-mod block_with_tx_hash;
 mod common;
 mod redis_db;
 
-use crate::block_with_tx_hash::BlockWithTxHashes;
 use dotenv::dotenv;
 use fastnear_neardata_fetcher::fetcher;
+use fastnear_primitives::block_with_tx_hash::BlockWithTxHashes;
 use fastnear_primitives::near_primitives::hash::hash;
-use near_indexer::near_primitives::hash::CryptoHash;
+use fastnear_primitives::near_primitives::hash::CryptoHash;
+use fastnear_primitives::near_primitives::views::ReceiptView;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
-use near_indexer::near_primitives::views::ReceiptView;
 use redis_db::RedisDB;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -238,8 +237,11 @@ async fn listen_blocks(
     let mut last_block_height = None;
     let mut last_block_hash = None;
     while let Some(streamer_message) = stream.recv().await {
-        let block_height = streamer_message.block.header.height;
-        let prev_block_height = streamer_message.block.header.prev_height;
+        let fastnear_streamer_message: fastnear_primitives::near_indexer_primitives::StreamerMessage =
+            serde_json::from_slice(&serde_json::to_vec(&streamer_message).unwrap()).unwrap();
+        let mut block: BlockWithTxHashes = fastnear_streamer_message.into();
+        let block_height = block.block.header.height;
+        let prev_block_height = block.block.header.prev_height;
         if let Some(prev_block_height) = prev_block_height {
             assert!(
                 expected_block_height > prev_block_height,
@@ -249,7 +251,7 @@ async fn listen_blocks(
             );
         }
         expected_block_height = block_height + 1;
-        let prev_block_hash = streamer_message.block.header.prev_hash;
+        let prev_block_hash = block.block.header.prev_hash;
         if let Some(last_block_hash) = last_block_hash {
             if last_block_hash != prev_block_hash {
                 let message = format!(
@@ -268,15 +270,14 @@ async fn listen_blocks(
                 }
             }
         }
-        last_block_hash = Some(streamer_message.block.header.hash);
-        let block_timestamp = streamer_message.block.header.timestamp;
+        last_block_hash = Some(block.block.header.hash);
+        let block_timestamp = block.block.header.timestamp;
         let current_time_ns = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos() as u64;
         let time_diff_ns = current_time_ns.saturating_sub(block_timestamp);
         tracing::log::info!(target: PROJECT_ID, "Processing block {}\tlatency {:.3} sec", block_height, time_diff_ns as f64 / 1e9f64);
-        let mut block: BlockWithTxHashes = streamer_message.into();
         let receipts_with_missing_tx_hashes =
             process_block(&mut tx_cache, &mut block, last_block_height);
         last_block_height = Some(block_height);
