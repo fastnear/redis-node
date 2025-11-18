@@ -6,7 +6,6 @@ use dotenv::dotenv;
 use near_indexer::near_primitives::hash::CryptoHash;
 use near_indexer::near_primitives::types::BlockHeight;
 use near_indexer::streamer::build_streamer_message;
-use near_indexer::streamer::fetchers::fetch_block_by_height;
 use near_indexer::{Indexer, StreamerMessage};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -144,7 +143,13 @@ fn main() {
 
     let sys = actix::System::new();
     sys.block_on(async move {
-        let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
+        let near_config = indexer_config
+            .load_near_config()
+            .expect("failed to load near config");
+        let near_node = Indexer::start_near_node(&indexer_config, near_config.clone())
+            .await
+            .expect("failed to start near node");
+        let indexer = Indexer::from_near_node(indexer_config, near_config, &near_node);
         let stream = streamer(indexer, start_block_height, end_block_height);
         listen_blocks(
             stream,
@@ -168,8 +173,8 @@ async fn start(
     // Reading the input file
     let view_client = indexer.view_client.clone();
     for block_height in start_block_height - RECEIPT_BACKFILL_DEPTH..end_block_height {
-        let block = fetch_block_by_height(&view_client, block_height).await;
-        if let Ok(block) = block {
+        let block = view_client.fetch_block_by_height(block_height).await;
+        if let Ok(Some(block)) = block {
             let response =
                 build_streamer_message(&view_client, block, &indexer.shard_tracker).await;
             if let Ok(response) = response {
