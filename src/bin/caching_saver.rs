@@ -57,7 +57,7 @@ async fn block_producer(
 ) {
     let mut last_id = format!("{}-0", *last_processed_block.read().unwrap());
     loop {
-        let res = redis_db.xread(10, &blocks_key, &last_id).await;
+        let res = redis_db.xread(10, 5000, &blocks_key, &last_id).await;
         let res = match res {
             Ok(res) => res,
             Err(err) => {
