@@ -57,7 +57,7 @@ async fn block_producer(
 ) {
     let mut last_id = format!("{}-0", *last_processed_block.read().unwrap());
     loop {
-        let res = redis_db.xread(1, &blocks_key, &last_id).await;
+        let res = redis_db.xread(10, &blocks_key, &last_id).await;
         let res = match res {
             Ok(res) => res,
             Err(err) => {
@@ -76,21 +76,29 @@ async fn block_producer(
             }
         };
         if res.is_empty() {
-            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+            tokio::time::sleep(tokio::time::Duration::from_millis(250)).await;
             continue;
         }
-        let (id, key_values) = res.into_iter().next().unwrap();
-        assert_eq!(key_values.len(), 1, "Expected 1 key-value pair");
-        let (key, value) = key_values.into_iter().next().unwrap();
-        assert_eq!(key, BLOCK_KEY, "Expected key to be block");
-        let block_height: BlockHeight = id.split_once("-").unwrap().0.parse().unwrap();
-        tracing::debug!(target: PROJECT_ID, "Adding block {} from redis {:?}", block_height, redis_db.client.get_connection_info().addr);
-        sink.send((block_height, value)).await.unwrap();
-        let current_processed_block = *last_processed_block.read().unwrap();
-        if current_processed_block > block_height {
-            last_id = format!("{}-0", current_processed_block);
-        } else {
-            last_id = id;
+        let mut entries: Vec<_> = res
+            .into_iter()
+            .map(|(id, key_values)| {
+                assert_eq!(key_values.len(), 1, "Expected 1 key-value pair");
+                let (key, value) = key_values.into_iter().next().unwrap();
+                assert_eq!(key, BLOCK_KEY, "Expected key to be block");
+                let block_height: BlockHeight = id.split_once("-").unwrap().0.parse().unwrap();
+                (id, block_height, value)
+            })
+            .collect();
+        entries.sort_by_key(|(_id, block_height, _value)| *block_height);
+        for (id, block_height, value) in entries {
+            tracing::debug!(target: PROJECT_ID, "Adding block {} from redis {:?}", block_height, redis_db.client.get_connection_info().addr);
+            sink.send((block_height, value)).await.unwrap();
+            let current_processed_block = *last_processed_block.read().unwrap();
+            if current_processed_block > block_height {
+                last_id = format!("{}-0", current_processed_block);
+            } else {
+                last_id = id;
+            }
         }
     }
 }
