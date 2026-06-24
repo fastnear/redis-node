@@ -199,11 +199,7 @@ fn main() {
                     finality: config.finality.clone(),
                 };
 
-                let near_config = indexer_config.load_near_config()
-                    .expect("failed to load near config");
-                let near_node = near_indexer::Indexer::start_near_node(&indexer_config, near_config.clone()).await
-                    .expect("failed to start near node");
-                let indexer = near_indexer::Indexer::from_near_node(indexer_config, near_config, &near_node);
+                let indexer = near_indexer::Indexer::new(indexer_config).await.expect("Failed to create indexer");
                 let stream = indexer.streamer();
                 listen_blocks(
                     stream,

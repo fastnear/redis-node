@@ -143,13 +143,9 @@ fn main() {
 
     let sys = actix::System::new();
     sys.block_on(async move {
-        let near_config = indexer_config
-            .load_near_config()
-            .expect("failed to load near config");
-        let near_node = Indexer::start_near_node(&indexer_config, near_config.clone())
+        let indexer = near_indexer::Indexer::new(indexer_config)
             .await
-            .expect("failed to start near node");
-        let indexer = Indexer::from_near_node(indexer_config, near_config, &near_node);
+            .expect("Failed to create indexer");
         let stream = streamer(indexer, start_block_height, end_block_height);
         listen_blocks(
             stream,
