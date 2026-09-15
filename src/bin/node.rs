@@ -84,8 +84,21 @@ const DEFAULT_BLOCK_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 const BACKFILL_GAP: u64 = 32;
 
 /// Multiple of `OPTIMISTIC_ENABLE_THRESHOLD` at which a running optimistic output is shed so the
-/// primary can catch up alone. Wide enough that enable/disable cannot oscillate.
+/// primary can catch up alone.
 const OPTIMISTIC_DISABLE_MULTIPLIER: u64 = 4;
+
+/// How old the primary's head block may be for the node to count as caught up with the network.
+/// Threshold width alone is not enough to keep the gate stable: starting the optimistic output is
+/// itself what makes the primary lag, so a purely cursor-based gate oscillates. Head age moves on
+/// the timescale of syncing rather than of one sweep, which is what actually settles it.
+const OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS: u64 = 30;
+
+/// Consecutive ticks the primary must stay over the shed threshold before we shed, and how long to
+/// wait afterwards before reconsidering. At the default 50ms interval that is 5s of sustained
+/// overload and a 30s cooldown - the optimistic output re-anchors and replays ~260 blocks every
+/// time it starts, so starting it must never be cheap to trigger.
+const OPTIMISTIC_SHED_TICKS: u32 = 100;
+const OPTIMISTIC_COOLDOWN_TICKS: u64 = 600;
 
 /// How often (in sweep ticks) to log cursor/cache stats.
 const STATS_EVERY_N_TICKS: u64 = 200;
@@ -279,14 +292,14 @@ impl Builder {
 
     /// Current head height at the given finality. `Finality::None` is the (reorg-able) chain head,
     /// `Finality::Final` the final head. This is the *only* thing finality controls.
-    pub async fn head(&self, finality: &Finality) -> Option<BlockHeight> {
+    pub async fn head(&self, finality: &Finality) -> Option<(BlockHeight, u64)> {
         match self
             .indexer
             .view_client
             .fetch_latest_block(finality.clone())
             .await
         {
-            Ok(block) => Some(block.header.height),
+            Ok(block) => Some((block.header.height, block.header.timestamp)),
             Err(err) => {
                 tracing::log::warn!(target: PROJECT_ID, "Failed to fetch latest block at {:?}: {:?}", finality, err);
                 None
@@ -405,7 +418,13 @@ pub struct Output {
     pub last_block_hash: Option<CryptoHash>,
     /// Refreshed once per sweep tick.
     pub head: BlockHeight,
+    /// Timestamp (unix nanos) of the block at `head`, for judging whether the node is caught up.
+    pub head_timestamp: u64,
     pub enabled: bool,
+    /// Consecutive ticks this output has been over the shed threshold.
+    pub shed_streak: u32,
+    /// Tick before which a shed output must not be reconsidered.
+    pub reactivate_after_tick: u64,
 }
 
 impl Output {
@@ -419,7 +438,10 @@ impl Output {
             last_block_height: None,
             last_block_hash: None,
             head: 0,
+            head_timestamp: 0,
             enabled: true,
+            shed_streak: 0,
+            reactivate_after_tick: 0,
         }
     }
 }
@@ -637,28 +659,48 @@ fn main() {
     }
 }
 
-/// How far an output is behind its own head, or `None` when the node has not even reached the
-/// height we already streamed - it is catching up, which is the opposite of caught up. Saturating
-/// arithmetic would report that as a gap of zero and read as "up to date", so it must not be used.
-fn primary_gap(output: &Output) -> Option<BlockHeight> {
-    output.head.checked_sub(output.cursor)
+/// Blocks still to sweep before this output is level with its head.
+///
+/// `Some(0)` is the caught-up state: the cursor sits one past the last block emitted, and that
+/// block is the head. That is why the bound is `head + 1` and not `head` - comparing against
+/// `head` reports the normal steady state as underflow. `None` means the cursor is beyond the head
+/// entirely, i.e. the node has not reached what we already streamed, which is the opposite of
+/// caught up and must never read as zero work.
+fn remaining_work(output: &Output) -> Option<BlockHeight> {
+    output.head.saturating_add(1).checked_sub(output.cursor)
 }
 
-/// Whether the primary output is close enough to its head to let the optimistic one start.
-/// A `None` gap means the node is still catching up, which is never close enough.
-fn should_activate_optimistic(gap: Option<BlockHeight>, threshold: u64) -> bool {
-    matches!(gap, Some(gap) if gap <= threshold)
+/// Age of the block at this output's head, in seconds. Large while the node is syncing.
+fn head_age_secs(output: &Output) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    now.saturating_sub(output.head_timestamp) / 1_000_000_000
 }
 
-/// Whether a running optimistic output should be shed so the primary gets the whole machine.
-fn should_shed_optimistic(gap: Option<BlockHeight>, threshold: u64) -> bool {
-    !matches!(gap, Some(gap) if gap <= threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER))
+/// Whether the primary has little enough left to do, and a recent enough head, to let the
+/// optimistic output start. `None` work means the node has not reached what we streamed, which is
+/// never close enough.
+fn should_activate_optimistic(
+    work: Option<BlockHeight>,
+    head_age_secs: u64,
+    threshold: u64,
+) -> bool {
+    matches!(work, Some(work) if work <= threshold)
+        && head_age_secs <= OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS
 }
 
-fn describe_gap(gap: Option<BlockHeight>) -> String {
-    match gap {
-        Some(gap) => format!("{} blocks", gap),
-        None => "behind the height we already streamed".to_string(),
+/// Whether the primary is overloaded this tick, counting towards shedding the optimistic output.
+/// Shedding only happens once this has held for `OPTIMISTIC_SHED_TICKS` ticks in a row.
+fn optimistic_is_crowding_primary(work: Option<BlockHeight>, threshold: u64) -> bool {
+    !matches!(work, Some(work) if work <= threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER))
+}
+
+fn describe_work(work: Option<BlockHeight>) -> String {
+    match work {
+        Some(work) => format!("{} blocks behind its head", work),
+        None => "ahead of its own node's head".to_string(),
     }
 }
 
@@ -671,7 +713,7 @@ fn describe_gap(gap: Option<BlockHeight>) -> String {
 fn priority_order(outputs: &[Output]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..outputs.len()).collect();
     order.sort_by_key(|&i| {
-        let backfilling = outputs[i].head.saturating_sub(outputs[i].cursor) > BACKFILL_GAP;
+        let backfilling = remaining_work(&outputs[i]).is_some_and(|work| work > BACKFILL_GAP);
         let finality_rank = match outputs[i].config.finality {
             Finality::None => 0,
             Finality::DoomSlug => 1,
@@ -701,30 +743,42 @@ async fn update_optimistic_gate(
     if outputs.len() < 2 {
         return;
     }
-    let gap = primary_gap(&outputs[0]);
+    let work = remaining_work(&outputs[0]);
+    let head_age = head_age_secs(&outputs[0]);
 
     if outputs[1].enabled {
         // Shed the optimistic output if the primary falls badly behind. Both outputs share one
         // sequential task, and once they drift further apart than the cache window the second one
         // stops hitting the cache, so staying enabled doubles the build load exactly when the
-        // machine is already losing. The primary is the stream with the completeness contract, so
-        // it gets the machine. The disable threshold is a wide multiple of the enable threshold,
-        // so this cannot flap.
-        let shed_at = threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER);
-        if should_shed_optimistic(gap, threshold) {
+        // machine is already losing. The primary holds the completeness contract, so it gets the
+        // machine. Shedding needs the overload to persist: a single bad tick is as likely to be
+        // the optimistic output's own activation backfill, and reacting to that oscillates.
+        if optimistic_is_crowding_primary(work, threshold) {
+            outputs[1].shed_streak += 1;
+        } else {
+            outputs[1].shed_streak = 0;
+        }
+        if outputs[1].shed_streak >= OPTIMISTIC_SHED_TICKS {
+            let shed_at = threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER);
             outputs[1].enabled = false;
-            tracing::log::error!(target: PROJECT_ID, "[{}] disabled: [{}] is {} behind its head (shed threshold {}); giving the machine to the final stream", outputs[1].config.name, outputs[0].config.name, describe_gap(gap), shed_at);
+            outputs[1].shed_streak = 0;
+            outputs[1].reactivate_after_tick = tick.saturating_add(OPTIMISTIC_COOLDOWN_TICKS);
+            tracing::log::error!(target: PROJECT_ID, "[{}] disabled: [{}] stayed {} for {} ticks (shed threshold {}); giving the machine to the final stream", outputs[1].config.name, outputs[0].config.name, describe_work(work), OPTIMISTIC_SHED_TICKS, shed_at);
         }
         return;
     }
 
-    if !should_activate_optimistic(gap, threshold) {
+    if tick < outputs[1].reactivate_after_tick {
+        return;
+    }
+
+    if !should_activate_optimistic(work, head_age, threshold) {
         if tick % STATS_EVERY_N_TICKS == 0 {
-            tracing::log::info!(target: PROJECT_ID, "[{}] holding off, [{}] is {} behind its head (threshold {})", outputs[1].config.name, outputs[0].config.name, describe_gap(gap), threshold);
+            tracing::log::info!(target: PROJECT_ID, "[{}] holding off, [{}] is {} and its head is {}s old (thresholds {} blocks / {}s)", outputs[1].config.name, outputs[0].config.name, describe_work(work), head_age, threshold, OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS);
         }
         return;
     }
-    let Some(head) = builder.head(&outputs[1].config.finality).await else {
+    let Some((head, head_timestamp)) = builder.head(&outputs[1].config.finality).await else {
         return;
     };
     let watermark = head.saturating_sub(OPTIMISTIC_DEPTH);
@@ -736,7 +790,9 @@ async fn update_optimistic_gate(
     optimistic.last_block_height = None;
     optimistic.last_block_hash = None;
     optimistic.head = head;
+    optimistic.head_timestamp = head_timestamp;
     optimistic.enabled = true;
+    optimistic.shed_streak = 0;
     tracing::log::info!(target: PROJECT_ID, "[{}] activated at head {}: sweeping from {}, emitting above {}", optimistic.config.name, head, cursor, watermark);
 }
 
@@ -763,8 +819,9 @@ async fn run(
             if !output.enabled {
                 continue;
             }
-            if let Some(head) = builder.head(&output.config.finality).await {
+            if let Some((head, head_timestamp)) = builder.head(&output.config.finality).await {
                 output.head = head;
+                output.head_timestamp = head_timestamp;
             }
         }
 
@@ -809,19 +866,21 @@ async fn run(
             let cursors = outputs
                 .iter()
                 .filter(|o| o.enabled)
-                .map(|o| format!("{}={}/{}", o.config.name, o.cursor, o.head))
+                .map(|o| {
+                    format!(
+                        "{}=cursor {} head {} ({} left, head {}s old)",
+                        o.config.name,
+                        o.cursor,
+                        o.head,
+                        remaining_work(o)
+                            .map(|w| w.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        head_age_secs(o)
+                    )
+                })
                 .collect::<Vec<_>>()
-                .join(" ");
-            tracing::log::info!(target: PROJECT_ID, "Cursors {} cache {} blocks / {} bytes", cursors, builder.cache.len(), builder.cache.bytes());
-            // Once the optimistic output is running we leave it running rather than flapping it,
-            // but a backlog that re-opens means the machine is no longer keeping up.
-            let gap = primary_gap(&outputs[0]);
-            if outputs.len() > 1
-                && outputs[1].enabled
-                && !should_activate_optimistic(gap, optimistic_enable_threshold)
-            {
-                tracing::log::error!(target: PROJECT_ID, "[{}] is {} behind its head (threshold {}) while [{}] is running", outputs[0].config.name, describe_gap(gap), optimistic_enable_threshold, outputs[1].config.name);
-            }
+                .join("  ");
+            tracing::log::info!(target: PROJECT_ID, "{}  cache {} blocks / {} bytes", cursors, builder.cache.len(), builder.cache.bytes());
         }
     }
 }
@@ -1182,37 +1241,53 @@ mod tests {
         assert_eq!(cache.len(), 0);
     }
 
-    /// Regression: the gap used `saturating_sub`, so "the node has not even reached the height we
-    /// already streamed" collapsed to a gap of 0 and read as "fully caught up" - activating the
-    /// optimistic output during precisely the catch-up it exists to stay out of.
+    /// Regression, both directions. The cursor sits one past the last block emitted, so being
+    /// level with the head means `cursor == head + 1`. Measuring against `head` reported that
+    /// normal steady state as underflow; measuring with saturating arithmetic reported a node
+    /// that had not reached our cursor as zero work. Both mis-read the gate.
     #[test]
-    fn a_node_behind_the_streamed_height_is_not_caught_up() {
+    fn remaining_work_separates_caught_up_from_behind() {
         let mut primary = output("final", Finality::Final, 1000, 1000);
 
-        // Node head is below our cursor: still catching up.
-        primary.head = 800;
-        assert_eq!(primary_gap(&primary), None);
-        assert!(!should_activate_optimistic(primary_gap(&primary), 200));
-        assert!(should_shed_optimistic(primary_gap(&primary), 200));
+        // Level with the head: nothing left to do.
+        primary.head = 999;
+        assert_eq!(remaining_work(&primary), Some(0));
+        assert!(should_activate_optimistic(remaining_work(&primary), 0, 200));
 
-        // Genuinely caught up.
-        primary.head = 1001;
-        assert_eq!(primary_gap(&primary), Some(1));
-        assert!(should_activate_optimistic(primary_gap(&primary), 200));
-        assert!(!should_shed_optimistic(primary_gap(&primary), 200));
+        // One block to sweep.
+        primary.head = 1000;
+        assert_eq!(remaining_work(&primary), Some(1));
+
+        // Node has not reached what we already streamed: catching up, not caught up.
+        primary.head = 800;
+        assert_eq!(remaining_work(&primary), None);
+        assert!(!should_activate_optimistic(remaining_work(&primary), 0, 200));
+        assert!(optimistic_is_crowding_primary(remaining_work(&primary), 200));
+    }
+
+    /// A stale head means the node is still syncing, however little the cursor has left to do.
+    #[test]
+    fn a_stale_head_blocks_activation() {
+        let work = Some(0);
+        assert!(should_activate_optimistic(work, 5, 200));
+        assert!(!should_activate_optimistic(
+            work,
+            OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS + 1,
+            200
+        ));
     }
 
     #[test]
     fn optimistic_gate_has_hysteresis() {
         let threshold = 200;
-        // Between the enable and shed thresholds: neither starts nor stops.
-        assert!(!should_activate_optimistic(Some(500), threshold));
-        assert!(!should_shed_optimistic(Some(500), threshold));
+        // Between the enable and shed thresholds: neither starts nor counts towards stopping.
+        assert!(!should_activate_optimistic(Some(500), 0, threshold));
+        assert!(!optimistic_is_crowding_primary(Some(500), threshold));
         // Past the shed threshold (4x).
-        assert!(should_shed_optimistic(Some(801), threshold));
+        assert!(optimistic_is_crowding_primary(Some(801), threshold));
         // At the enable threshold exactly.
-        assert!(should_activate_optimistic(Some(200), threshold));
-        assert!(!should_activate_optimistic(Some(201), threshold));
+        assert!(should_activate_optimistic(Some(200), 0, threshold));
+        assert!(!should_activate_optimistic(Some(201), 0, threshold));
     }
 
     #[test]
