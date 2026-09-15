@@ -195,7 +195,7 @@ impl BlockCache {
     ) {
         if self.window == 0
             || block_height > keep_until.saturating_add(self.window)
-            || self.bytes >= self.max_bytes
+            || self.bytes + bytes.len() > self.max_bytes
             || self.by_hash.contains_key(&block_hash)
         {
             return;
@@ -750,6 +750,12 @@ async fn run(
 }
 
 /// Walks one output from its cursor up to the head it saw at the start of this tick.
+///
+/// The cursor only moves past a height that actually produced a block. Empty heights are still
+/// stepped over within the sweep, but if the tail of the range is empty the cursor stays put and
+/// those heights are re-read next tick. That matters at the tip: `fetch_latest_block` can return a
+/// head whose height index is not readable yet, and retiring that height permanently would leave a
+/// hole that trips the skipped-block assert on the very next block.
 async fn advance(
     builder: &mut Builder,
     output: &mut Output,
@@ -757,12 +763,13 @@ async fn advance(
     log_file: &mut File,
     keep_until: BlockHeight,
 ) {
-    while output.cursor <= output.head {
-        let block_height = output.cursor;
+    let mut block_height = output.cursor;
+    while block_height <= output.head {
         if let Some((_block_hash, bytes)) = builder.get_or_build(block_height, keep_until).await {
             emit_block(output, db, log_file, &bytes).await;
+            output.cursor = block_height + 1;
         }
-        output.cursor = block_height + 1;
+        block_height += 1;
     }
 }
 
@@ -955,4 +962,139 @@ fn process_block(
     }
 
     receipts_with_missing_tx_hashes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_hash(n: u8) -> BlockHash {
+        BlockHash::hash_bytes(&[n])
+    }
+
+    fn bytes(len: usize) -> Arc<Vec<u8>> {
+        Arc::new(vec![0u8; len])
+    }
+
+    fn output(name: &'static str, finality: Finality, cursor: BlockHeight, head: BlockHeight) -> Output {
+        let mut o = Output::new(
+            OutputConfig {
+                name,
+                blocks_key: name.to_string(),
+                finality,
+                max_num_blocks: None,
+                stream_to_redis: false,
+                log_blocks: false,
+                strict_hash_check: true,
+                fatal_on_redis_failure: true,
+                receipt_backfill_depth: RECEIPT_BACKFILL_DEPTH,
+                missing_receipts_whitelist: Arc::new(HashSet::new()),
+            },
+            cursor,
+            0,
+        );
+        o.head = head;
+        o
+    }
+
+    #[test]
+    fn cache_admits_within_the_window_only() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.admit(1064, block_hash(2), &bytes(10), 1000);
+        // One past the window.
+        cache.admit(1065, block_hash(3), &bytes(10), 1000);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&block_hash(3)).is_none());
+        assert_eq!(cache.bytes(), 20);
+    }
+
+    #[test]
+    fn cache_is_inert_with_a_zero_window() {
+        let mut cache = BlockCache::new(0, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn cache_stops_admitting_at_the_byte_backstop() {
+        let mut cache = BlockCache::new(64, 100);
+        cache.admit(1000, block_hash(1), &bytes(99), 1000);
+        assert_eq!(cache.len(), 1);
+        // Already at/over the cap, so nothing more is taken.
+        cache.admit(1001, block_hash(2), &bytes(10), 1000);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 99);
+    }
+
+    #[test]
+    fn prune_keeps_the_boundary_height() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.admit(1001, block_hash(2), &bytes(10), 1000);
+        cache.admit(1002, block_hash(3), &bytes(10), 1000);
+        cache.prune_below(1001);
+        assert!(cache.get(&block_hash(1)).is_none());
+        assert!(cache.get(&block_hash(2)).is_some());
+        assert!(cache.get(&block_hash(3)).is_some());
+        assert_eq!(cache.bytes(), 20);
+    }
+
+    /// A reorg leaves two hashes at one height. Both must be reachable while the height is live,
+    /// and both must go when it is pruned - a one-to-one height index would leak the orphan.
+    #[test]
+    fn reorged_height_keeps_both_blocks_and_leaks_neither() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        let orphan = block_hash(1);
+        let canonical = block_hash(2);
+        cache.admit(1000, orphan, &bytes(10), 1000);
+        cache.admit(1000, canonical, &bytes(10), 1000);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&orphan).is_some());
+        assert!(cache.get(&canonical).is_some());
+
+        cache.prune_below(1001);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn admitting_the_same_block_twice_does_not_double_count() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 10);
+        cache.prune_below(1001);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn closing_the_window_drops_everything() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.set_window(0);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        assert_eq!(cache.len(), 0);
+    }
+
+    #[test]
+    fn live_outputs_sweep_before_backfilling_ones() {
+        // Steady state: both caught up, so the latency-sensitive optimistic stream leads.
+        let outputs = vec![
+            output("final", Finality::Final, 1000, 1000),
+            output("optimistic", Finality::None, 1002, 1002),
+        ];
+        assert_eq!(priority_order(&outputs), vec![1, 0]);
+
+        // Just activated: the optimistic backfill must not sit in front of a live final block.
+        let outputs = vec![
+            output("final", Finality::Final, 1000, 1001),
+            output("optimistic", Finality::None, 740, 1001),
+        ];
+        assert_eq!(priority_order(&outputs), vec![0, 1]);
+    }
 }
