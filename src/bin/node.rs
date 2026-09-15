@@ -83,6 +83,10 @@ const DEFAULT_BLOCK_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 /// How far behind its head an output has to be before it counts as backfilling rather than live.
 const BACKFILL_GAP: u64 = 32;
 
+/// Multiple of `OPTIMISTIC_ENABLE_THRESHOLD` at which a running optimistic output is shed so the
+/// primary can catch up alone. Wide enough that enable/disable cannot oscillate.
+const OPTIMISTIC_DISABLE_MULTIPLIER: u64 = 4;
+
 /// How often (in sweep ticks) to log cursor/cache stats.
 const STATS_EVERY_N_TICKS: u64 = 200;
 
@@ -257,7 +261,12 @@ impl BlockCache {
 /// single process serve several finalities: `streamer::start` opens `<home>/data/indexer` with
 /// `DB::open_default` (a second open panics) and relies on nearcore's process-global
 /// `DELAYED_LOCAL_RECEIPTS_CACHE`, whose destructive `remove()` breaks if two builders race.
-/// With one shared builder each (height, hash) is built at most once, exactly as before.
+///
+/// In steady state each (height, hash) is built exactly once and the second output reads the
+/// cache, so that global map sees the same insert/remove pairing a single-finality node produces.
+/// That is not true in general - an output further behind than `BLOCK_CACHE_WINDOW` gets no cache
+/// hits - which is why `run` makes a backfilling output bypass the cache and rebuild contiguously
+/// rather than alternate between hits and misses.
 pub struct Builder {
     indexer: near_indexer::Indexer,
     cache: BlockCache,
@@ -294,6 +303,7 @@ impl Builder {
         &mut self,
         block_height: BlockHeight,
         keep_until: BlockHeight,
+        use_cache: bool,
     ) -> Option<(BlockHash, Arc<Vec<u8>>)> {
         let mut delay = Duration::from_millis(INITIAL_RETRY_DELAY);
         for attempt in 0..MAX_BUILD_RETRIES {
@@ -317,8 +327,10 @@ impl Builder {
             };
 
             let block_hash = block.header.hash;
-            if let Some(bytes) = self.cache.get(&block_hash) {
-                return Some((block_hash, bytes));
+            if use_cache {
+                if let Some(bytes) = self.cache.get(&block_hash) {
+                    return Some((block_hash, bytes));
+                }
             }
 
             // Boxed because the future is large - `near_indexer::streamer::start` boxes it too.
@@ -341,7 +353,9 @@ impl Builder {
             let bytes = Arc::new(
                 serde_json::to_vec(&streamer_message).expect("Failed to serialize streamer message"),
             );
-            self.cache.admit(block_height, block_hash, &bytes, keep_until);
+            if use_cache {
+                self.cache.admit(block_height, block_hash, &bytes, keep_until);
+            }
             return Some((block_hash, bytes));
         }
         panic!(
@@ -366,6 +380,11 @@ pub struct OutputConfig {
     /// Whether exhausting the Redis write retries kills the process. Final streams must not have
     /// gaps (`caching-saver` assumes contiguity); the optimistic stream tolerates them.
     pub fatal_on_redis_failure: bool,
+    /// Whether a receipt with no known tx hash kills the process. A stream that follows the chain
+    /// head necessarily has an incomplete tx map: after a reorg its cursor has already passed the
+    /// replaced heights, so transactions that only exist on the new fork were never recorded, and
+    /// their receipts legitimately resolve to `None` a few blocks later.
+    pub fatal_on_missing_tx_hashes: bool,
     pub receipt_backfill_depth: u64,
     pub missing_receipts_whitelist: Arc<HashSet<CryptoHash>>,
 }
@@ -560,6 +579,7 @@ fn main() {
                         log_blocks,
                         strict_hash_check: true,
                         fatal_on_redis_failure: true,
+                        fatal_on_missing_tx_hashes: true,
                         receipt_backfill_depth,
                         missing_receipts_whitelist: Arc::clone(&missing_receipts_whitelist),
                     },
@@ -578,8 +598,11 @@ fn main() {
                             log_blocks,
                             // Streaming the chain head means seeing reorgs; that is the point.
                             strict_hash_check: false,
-                            // A gap here must not take the final stream down with it.
+                            // Neither of these may take the final stream down with it: the process
+                            // aborts on panic, so an optimistic-only failure would cost a full
+                            // neard restart plus a 250-block final backfill.
                             fatal_on_redis_failure: false,
+                            fatal_on_missing_tx_hashes: false,
                             receipt_backfill_depth,
                             missing_receipts_whitelist: Arc::clone(&missing_receipts_whitelist),
                         },
@@ -614,6 +637,31 @@ fn main() {
     }
 }
 
+/// How far an output is behind its own head, or `None` when the node has not even reached the
+/// height we already streamed - it is catching up, which is the opposite of caught up. Saturating
+/// arithmetic would report that as a gap of zero and read as "up to date", so it must not be used.
+fn primary_gap(output: &Output) -> Option<BlockHeight> {
+    output.head.checked_sub(output.cursor)
+}
+
+/// Whether the primary output is close enough to its head to let the optimistic one start.
+/// A `None` gap means the node is still catching up, which is never close enough.
+fn should_activate_optimistic(gap: Option<BlockHeight>, threshold: u64) -> bool {
+    matches!(gap, Some(gap) if gap <= threshold)
+}
+
+/// Whether a running optimistic output should be shed so the primary gets the whole machine.
+fn should_shed_optimistic(gap: Option<BlockHeight>, threshold: u64) -> bool {
+    !matches!(gap, Some(gap) if gap <= threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER))
+}
+
+fn describe_gap(gap: Option<BlockHeight>) -> String {
+    match gap {
+        Some(gap) => format!("{} blocks", gap),
+        None => "behind the height we already streamed".to_string(),
+    }
+}
+
 /// Sweep order: outputs that are up to date go first, so a backfill (notably the ~260 blocks the
 /// optimistic output replays when it activates) never sits in front of somebody's live block.
 /// Among those, lowest finality first, because `Finality::None` is the latency-sensitive stream.
@@ -644,19 +692,35 @@ fn priority_order(outputs: &[Output]) -> Vec<usize> {
 /// caught up, so the local head is the better anchor, and it keeps startup off
 /// `fetch_block_until_success`, which retries forever with no overall timeout - a neardata outage
 /// would otherwise hang the whole process and neither stream would start.
-async fn maybe_activate_optimistic(
+async fn update_optimistic_gate(
     builder: &Builder,
     outputs: &mut [Output],
     threshold: u64,
     tick: u64,
 ) {
-    if outputs.len() < 2 || outputs[1].enabled {
+    if outputs.len() < 2 {
         return;
     }
-    let gap = outputs[0].head.saturating_sub(outputs[0].cursor);
-    if gap > threshold {
+    let gap = primary_gap(&outputs[0]);
+
+    if outputs[1].enabled {
+        // Shed the optimistic output if the primary falls badly behind. Both outputs share one
+        // sequential task, and once they drift further apart than the cache window the second one
+        // stops hitting the cache, so staying enabled doubles the build load exactly when the
+        // machine is already losing. The primary is the stream with the completeness contract, so
+        // it gets the machine. The disable threshold is a wide multiple of the enable threshold,
+        // so this cannot flap.
+        let shed_at = threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER);
+        if should_shed_optimistic(gap, threshold) {
+            outputs[1].enabled = false;
+            tracing::log::error!(target: PROJECT_ID, "[{}] disabled: [{}] is {} behind its head (shed threshold {}); giving the machine to the final stream", outputs[1].config.name, outputs[0].config.name, describe_gap(gap), shed_at);
+        }
+        return;
+    }
+
+    if !should_activate_optimistic(gap, threshold) {
         if tick % STATS_EVERY_N_TICKS == 0 {
-            tracing::log::info!(target: PROJECT_ID, "[{}] holding off, [{}] is {} blocks behind its head (threshold {})", outputs[1].config.name, outputs[0].config.name, gap, threshold);
+            tracing::log::info!(target: PROJECT_ID, "[{}] holding off, [{}] is {} behind its head (threshold {})", outputs[1].config.name, outputs[0].config.name, describe_gap(gap), threshold);
         }
         return;
     }
@@ -704,13 +768,7 @@ async fn run(
             }
         }
 
-        maybe_activate_optimistic(
-            &builder,
-            &mut outputs,
-            optimistic_enable_threshold,
-            tick,
-        )
-        .await;
+        update_optimistic_gate(&builder, &mut outputs, optimistic_enable_threshold, tick).await;
 
         let enabled = outputs.iter().filter(|o| o.enabled).count();
         builder
@@ -726,9 +784,25 @@ async fn run(
         builder.cache.prune_below(keep_until);
 
         for i in priority_order(&outputs) {
-            if outputs[i].enabled {
-                advance(&mut builder, &mut outputs[i], &mut db, &mut log_file, keep_until).await;
+            if !outputs[i].enabled {
+                continue;
             }
+            // A backfilling output bypasses the cache entirely and rebuilds every block in order.
+            // Alternating cache hits and misses is the one pattern that breaks nearcore's global
+            // DELAYED_LOCAL_RECEIPTS_CACHE: a hit skips `build_streamer_message`, so the receipt
+            // that block inserts is never inserted, and the later block that consumes it finds
+            // nothing and falls into a 1000-block backward scan. Building contiguously keeps the
+            // insert/remove pairing self-consistent, exactly as a single-finality node does.
+            let use_cache = outputs[i].head.saturating_sub(outputs[i].cursor) <= BACKFILL_GAP;
+            advance(
+                &mut builder,
+                &mut outputs[i],
+                &mut db,
+                &mut log_file,
+                keep_until,
+                use_cache,
+            )
+            .await;
         }
 
         if tick % STATS_EVERY_N_TICKS == 0 {
@@ -741,9 +815,12 @@ async fn run(
             tracing::log::info!(target: PROJECT_ID, "Cursors {} cache {} blocks / {} bytes", cursors, builder.cache.len(), builder.cache.bytes());
             // Once the optimistic output is running we leave it running rather than flapping it,
             // but a backlog that re-opens means the machine is no longer keeping up.
-            let gap = outputs[0].head.saturating_sub(outputs[0].cursor);
-            if outputs.len() > 1 && outputs[1].enabled && gap > optimistic_enable_threshold {
-                tracing::log::error!(target: PROJECT_ID, "[{}] is {} blocks behind its head (threshold {}) while [{}] is running", outputs[0].config.name, gap, optimistic_enable_threshold, outputs[1].config.name);
+            let gap = primary_gap(&outputs[0]);
+            if outputs.len() > 1
+                && outputs[1].enabled
+                && !should_activate_optimistic(gap, optimistic_enable_threshold)
+            {
+                tracing::log::error!(target: PROJECT_ID, "[{}] is {} behind its head (threshold {}) while [{}] is running", outputs[0].config.name, describe_gap(gap), optimistic_enable_threshold, outputs[1].config.name);
             }
         }
     }
@@ -762,10 +839,13 @@ async fn advance(
     db: &mut RedisDB,
     log_file: &mut File,
     keep_until: BlockHeight,
+    use_cache: bool,
 ) {
     let mut block_height = output.cursor;
     while block_height <= output.head {
-        if let Some((_block_hash, bytes)) = builder.get_or_build(block_height, keep_until).await {
+        if let Some((_block_hash, bytes)) =
+            builder.get_or_build(block_height, keep_until, use_cache).await
+        {
             emit_block(output, db, log_file, &bytes).await;
             output.cursor = block_height + 1;
         }
@@ -824,6 +904,23 @@ async fn emit_block(output: &mut Output, db: &mut RedisDB, log_file: &mut File, 
         process_block(&mut output.tx_cache, &mut block, output.last_block_height);
     output.last_block_height = Some(block_height);
 
+    // nearcore's `build_streamer_message` has a `ProtocolFeature::Spice` early return that yields
+    // a block with every shard's `chunk: None` and no outcomes at all (streamer/mod.rs, marked
+    // "TODO(spice): Add indexer support for spice"). That block is structurally valid, so it would
+    // stream to Redis as a chain with no transactions and nothing to distinguish it from a quiet
+    // block. Spice is protocol version 180 and stable is 86, so this cannot fire today - it arms
+    // the day we rebase onto a nearcore that stabilizes it. Halt rather than poison the streams.
+    // The node tracks all shards (asserted by `IndexerConfig::load_near_config`), so any included
+    // chunk is fetched, and `chunks_included > 0` with no chunks at all is otherwise impossible.
+    if block.block.header.chunks_included > 0 && block.shards.iter().all(|s| s.chunk.is_none()) {
+        panic!(
+            "[{}] Block {} reports {} included chunks but carries none. \
+             This is what nearcore emits once ProtocolFeature::Spice is active; the indexer does \
+             not support it yet and would stream empty blocks. Refusing to write.",
+            output.config.name, block_height, block.block.header.chunks_included
+        );
+    }
+
     let past_watermark = output.redis_watermark < block_height;
 
     if !receipts_with_missing_tx_hashes.is_empty() {
@@ -833,17 +930,20 @@ async fn emit_block(output: &mut Output, db: &mut RedisDB, log_file: &mut File, 
             .collect::<Vec<_>>()
             .join(", ");
         tracing::log::warn!(target: PROJECT_ID, "[{}] Block {} is missing some tx hashes for receipts: [{}]", output.config.name, block_height, hashes_str);
-        if past_watermark {
-            if receipts_with_missing_tx_hashes
+        if past_watermark
+            && receipts_with_missing_tx_hashes
                 .iter()
                 .any(|r| !output.config.missing_receipts_whitelist.contains(&r.receipt_id))
-            {
-                tracing::log::error!(target: PROJECT_ID, "[{}] Block {} is missing some tx hashes for receipts: [{:?}]", output.config.name, block_height, receipts_with_missing_tx_hashes);
+        {
+            tracing::log::error!(target: PROJECT_ID, "[{}] Block {} is missing some tx hashes for receipts: [{:?}]", output.config.name, block_height, receipts_with_missing_tx_hashes);
+            if output.config.fatal_on_missing_tx_hashes {
                 panic!(
                     "[{}] Block {} is missing some tx hashes for receipts: [{}]",
                     output.config.name, block_height, hashes_str
                 );
             }
+            // `tx_hash: None` is a representable value and the whitelist already emits blocks
+            // carrying it, so degrade rather than take the final stream down with us.
         }
     }
 
@@ -987,6 +1087,7 @@ mod tests {
                 log_blocks: false,
                 strict_hash_check: true,
                 fatal_on_redis_failure: true,
+                fatal_on_missing_tx_hashes: true,
                 receipt_backfill_depth: RECEIPT_BACKFILL_DEPTH,
                 missing_receipts_whitelist: Arc::new(HashSet::new()),
             },
@@ -1079,6 +1180,39 @@ mod tests {
         assert_eq!(cache.bytes(), 0);
         cache.admit(1000, block_hash(1), &bytes(10), 1000);
         assert_eq!(cache.len(), 0);
+    }
+
+    /// Regression: the gap used `saturating_sub`, so "the node has not even reached the height we
+    /// already streamed" collapsed to a gap of 0 and read as "fully caught up" - activating the
+    /// optimistic output during precisely the catch-up it exists to stay out of.
+    #[test]
+    fn a_node_behind_the_streamed_height_is_not_caught_up() {
+        let mut primary = output("final", Finality::Final, 1000, 1000);
+
+        // Node head is below our cursor: still catching up.
+        primary.head = 800;
+        assert_eq!(primary_gap(&primary), None);
+        assert!(!should_activate_optimistic(primary_gap(&primary), 200));
+        assert!(should_shed_optimistic(primary_gap(&primary), 200));
+
+        // Genuinely caught up.
+        primary.head = 1001;
+        assert_eq!(primary_gap(&primary), Some(1));
+        assert!(should_activate_optimistic(primary_gap(&primary), 200));
+        assert!(!should_shed_optimistic(primary_gap(&primary), 200));
+    }
+
+    #[test]
+    fn optimistic_gate_has_hysteresis() {
+        let threshold = 200;
+        // Between the enable and shed thresholds: neither starts nor stops.
+        assert!(!should_activate_optimistic(Some(500), threshold));
+        assert!(!should_shed_optimistic(Some(500), threshold));
+        // Past the shed threshold (4x).
+        assert!(should_shed_optimistic(Some(801), threshold));
+        // At the enable threshold exactly.
+        assert!(should_activate_optimistic(Some(200), threshold));
+        assert!(!should_activate_optimistic(Some(201), threshold));
     }
 
     #[test]
