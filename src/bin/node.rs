@@ -1,3 +1,31 @@
+//! Streams blocks out of an embedded `neard` node into one or two Redis streams.
+//!
+//! A single process can serve several finalities at once, because `finality` only picks the head
+//! a sweep runs up to - every block below it is fetched by height from the canonical index and
+//! built by the same code. Set `OPTIMISTIC_BLOCKS_KEY` to get the chain head alongside the final
+//! stream instead of running a second node for it.
+//!
+//! Environment:
+//!   REDIS_URL                     single URL (no commas - only `caching-saver` splits them)
+//!   BLOCKS_KEY                    stream key for the primary output
+//!   FINALITY                      JSON string: "final" | "near-final" | "optimistic"
+//!   STREAM_TO_REDIS               "true" to actually XADD
+//!   MAX_NUM_BLOCKS                XADD MAXLEN ~ N
+//!   START_BLOCK                   where to start when the stream is empty
+//!   RECEIPT_BACKFILL_DEPTH        blocks replayed to warm the receipt -> tx map (default 250)
+//!   MISSING_RECEIPTS_WHITELIST    receipt ids allowed to have no tx hash
+//!   LOG_BLOCKS                    write res/blocks_log.csv (default: STREAM_TO_REDIS)
+//!   SWEEP_INTERVAL_MS             poll interval (default 50)
+//!   NEARDATA_CHAIN_ID             "mainnet" | "testnet", falls back to CHAIN_ID
+//!
+//!   OPTIMISTIC_BLOCKS_KEY         set to also stream the chain head to this key
+//!   OPTIMISTIC_MAX_NUM_BLOCKS     MAXLEN for that stream (default: MAX_NUM_BLOCKS)
+//!   OPTIMISTIC_ENABLE_THRESHOLD   how close the primary output must be to its head before the
+//!                                 optimistic one starts (default 200)
+//!   BLOCK_CACHE_WINDOW            blocks kept for the second output to reuse (default 64,
+//!                                 0 disables the cache)
+//!   BLOCK_CACHE_MAX_BYTES         cache backstop (default 256 MiB)
+
 use std::io::Write;
 mod common;
 mod redis_db;
@@ -41,6 +69,19 @@ const RECEIPT_HASH_CLEANUP_BLOCKS: u64 = 10;
 const MAX_BUILD_RETRIES: usize = 10;
 
 const DEFAULT_SWEEP_INTERVAL_MS: u64 = 50;
+
+/// How far the primary output may lag its head before the optimistic output is allowed to start.
+const DEFAULT_OPTIMISTIC_ENABLE_THRESHOLD: u64 = 200;
+
+/// How many blocks ahead of the slowest cursor a built block is still worth caching.
+const DEFAULT_BLOCK_CACHE_WINDOW: u64 = 64;
+
+/// Backstop on the block cache. Typical mainnet blocks are 100-500 KB of JSON, so the window is
+/// normally the binding constraint and this only matters on a run of unusually large blocks.
+const DEFAULT_BLOCK_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// How far behind its head an output has to be before it counts as backfilling rather than live.
+const BACKFILL_GAP: u64 = 32;
 
 /// How often (in sweep ticks) to log cursor/cache stats.
 const STATS_EVERY_N_TICKS: u64 = 200;
@@ -179,6 +220,20 @@ impl BlockCache {
                     self.bytes = self.bytes.saturating_sub(bytes.len());
                 }
             }
+        }
+    }
+
+    /// The cache only earns its keep while two outputs are actually sweeping. Setting the window
+    /// to 0 (single output, or the optimistic output still held off) makes it provably inert.
+    pub fn set_window(&mut self, window: u64) {
+        if window == self.window {
+            return;
+        }
+        self.window = window;
+        if window == 0 {
+            self.by_hash.clear();
+            self.heights.clear();
+            self.bytes = 0;
         }
     }
 
@@ -385,6 +440,38 @@ fn main() {
             .unwrap_or(DEFAULT_SWEEP_INTERVAL_MS),
     );
 
+    // Setting OPTIMISTIC_BLOCKS_KEY is what turns this into a two-stream node.
+    let optimistic_blocks_key = env::var("OPTIMISTIC_BLOCKS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(optimistic_blocks_key) = optimistic_blocks_key.as_ref() {
+        assert_ne!(
+            optimistic_blocks_key, &blocks_key,
+            "BLOCKS_KEY and OPTIMISTIC_BLOCKS_KEY must differ. Pointing both sweeps at one stream \
+             would silently drop half the blocks: the second write of each height comes back as \
+             `The ID specified in XADD is equal or smaller ...`, which we treat as a benign duplicate."
+        );
+        assert_ne!(
+            finality,
+            Finality::None,
+            "FINALITY must not be `optimistic` when OPTIMISTIC_BLOCKS_KEY is set, otherwise both \
+             outputs would sweep the same head."
+        );
+    }
+    let optimistic_max_num_blocks = env::var("OPTIMISTIC_MAX_NUM_BLOCKS")
+        .map(|s| s.parse().unwrap())
+        .ok()
+        .or(max_num_blocks);
+    let optimistic_enable_threshold = env::var("OPTIMISTIC_ENABLE_THRESHOLD")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_OPTIMISTIC_ENABLE_THRESHOLD);
+    let block_cache_window = env::var("BLOCK_CACHE_WINDOW")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_BLOCK_CACHE_WINDOW);
+    let block_cache_max_bytes = env::var("BLOCK_CACHE_MAX_BYTES")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_BLOCK_CACHE_MAX_BYTES);
+
     // `RedisDB::new` hands the whole string to `Client::open`; only `caching-saver` splits on `,`.
     let redis_url = env::var("REDIS_URL").expect("Missing REDIS_URL env var");
     assert!(
@@ -463,7 +550,7 @@ fn main() {
 
                 let indexer = near_indexer::Indexer::new(indexer_config).await.expect("Failed to create indexer");
 
-                let output = Output::new(
+                let mut outputs = vec![Output::new(
                     OutputConfig {
                         name: "final",
                         blocks_key,
@@ -474,16 +561,50 @@ fn main() {
                         strict_hash_check: true,
                         fatal_on_redis_failure: true,
                         receipt_backfill_depth,
-                        missing_receipts_whitelist,
+                        missing_receipts_whitelist: Arc::clone(&missing_receipts_whitelist),
                     },
                     expected_block_height,
                     last_redis_block_height.unwrap_or(0),
-                );
+                )];
 
-                // A single output never benefits from the cache, so prove it is a no-op.
-                let builder = Builder::new(indexer, BlockCache::new(0, 0));
+                if let Some(optimistic_blocks_key) = optimistic_blocks_key {
+                    let mut optimistic = Output::new(
+                        OutputConfig {
+                            name: "optimistic",
+                            blocks_key: optimistic_blocks_key,
+                            finality: Finality::None,
+                            max_num_blocks: optimistic_max_num_blocks,
+                            stream_to_redis,
+                            log_blocks,
+                            // Streaming the chain head means seeing reorgs; that is the point.
+                            strict_hash_check: false,
+                            // A gap here must not take the final stream down with it.
+                            fatal_on_redis_failure: false,
+                            receipt_backfill_depth,
+                            missing_receipts_whitelist: Arc::clone(&missing_receipts_whitelist),
+                        },
+                        0,
+                        0,
+                    );
+                    // Anchored by `maybe_activate_optimistic` once the final output has caught up.
+                    optimistic.enabled = false;
+                    outputs.push(optimistic);
+                }
 
-                run(builder, vec![output], db, log_file, sweep_interval).await;
+                // `run` turns the window on only once two outputs are actually sweeping.
+                let block_cache_window = if outputs.len() > 1 { block_cache_window } else { 0 };
+                let builder = Builder::new(indexer, BlockCache::new(0, block_cache_max_bytes));
+
+                run(
+                    builder,
+                    outputs,
+                    db,
+                    log_file,
+                    sweep_interval,
+                    optimistic_enable_threshold,
+                    block_cache_window,
+                )
+                .await;
 
                 actix::System::current().stop();
             });
@@ -493,17 +614,66 @@ fn main() {
     }
 }
 
-/// Outputs to sweep, lowest finality first. `Finality::None` is latency-sensitive, so it goes
-/// first - but this is only a preference. Both outputs share one symmetric `get_or_build`, so
-/// whichever reaches a height first pays for it and correctness never depends on the order.
+/// Sweep order: outputs that are up to date go first, so a backfill (notably the ~260 blocks the
+/// optimistic output replays when it activates) never sits in front of somebody's live block.
+/// Among those, lowest finality first, because `Finality::None` is the latency-sensitive stream.
+///
+/// This is only a preference. Both outputs share one symmetric `get_or_build`, so whichever
+/// reaches a height first pays to build it and correctness never depends on the order.
 fn priority_order(outputs: &[Output]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..outputs.len()).collect();
-    order.sort_by_key(|&i| match outputs[i].config.finality {
-        Finality::None => 0,
-        Finality::DoomSlug => 1,
-        Finality::Final => 2,
+    order.sort_by_key(|&i| {
+        let backfilling = outputs[i].head.saturating_sub(outputs[i].cursor) > BACKFILL_GAP;
+        let finality_rank = match outputs[i].config.finality {
+            Finality::None => 0,
+            Finality::DoomSlug => 1,
+            Finality::Final => 2,
+        };
+        (backfilling, finality_rank)
     });
     order
+}
+
+/// The optimistic stream has no completeness contract - it already re-anchors near the head on
+/// every restart - so while the primary output has a real backlog we don't run it at all and spend
+/// the whole machine on catching up. Capping work per tick would not help: the cost is
+/// `build_streamer_message`, and at a 50ms interval any per-tick budget asks for more seconds of
+/// work than there are seconds of wall clock.
+///
+/// Activation anchors on the node's *local* head rather than neardata. By this point the node is
+/// caught up, so the local head is the better anchor, and it keeps startup off
+/// `fetch_block_until_success`, which retries forever with no overall timeout - a neardata outage
+/// would otherwise hang the whole process and neither stream would start.
+async fn maybe_activate_optimistic(
+    builder: &Builder,
+    outputs: &mut [Output],
+    threshold: u64,
+    tick: u64,
+) {
+    if outputs.len() < 2 || outputs[1].enabled {
+        return;
+    }
+    let gap = outputs[0].head.saturating_sub(outputs[0].cursor);
+    if gap > threshold {
+        if tick % STATS_EVERY_N_TICKS == 0 {
+            tracing::log::info!(target: PROJECT_ID, "[{}] holding off, [{}] is {} blocks behind its head (threshold {})", outputs[1].config.name, outputs[0].config.name, gap, threshold);
+        }
+        return;
+    }
+    let Some(head) = builder.head(&outputs[1].config.finality).await else {
+        return;
+    };
+    let watermark = head.saturating_sub(OPTIMISTIC_DEPTH);
+    let cursor = watermark.saturating_sub(outputs[1].config.receipt_backfill_depth + 1);
+    let optimistic = &mut outputs[1];
+    optimistic.redis_watermark = watermark;
+    optimistic.cursor = cursor;
+    optimistic.expected_block_height = cursor;
+    optimistic.last_block_height = None;
+    optimistic.last_block_hash = None;
+    optimistic.head = head;
+    optimistic.enabled = true;
+    tracing::log::info!(target: PROJECT_ID, "[{}] activated at head {}: sweeping from {}, emitting above {}", optimistic.config.name, head, cursor, watermark);
 }
 
 async fn run(
@@ -512,7 +682,14 @@ async fn run(
     mut db: RedisDB,
     mut log_file: File,
     interval: Duration,
+    optimistic_enable_threshold: u64,
+    block_cache_window: u64,
 ) {
+    debug_assert!(
+        outputs.len() <= 2
+            && (outputs.len() < 2 || outputs[1].config.finality == Finality::None),
+        "outputs[0] is the primary stream and outputs[1], when present, is the optimistic one"
+    );
     let mut tick: u64 = 0;
     loop {
         tokio::time::sleep(interval).await;
@@ -526,6 +703,19 @@ async fn run(
                 output.head = head;
             }
         }
+
+        maybe_activate_optimistic(
+            &builder,
+            &mut outputs,
+            optimistic_enable_threshold,
+            tick,
+        )
+        .await;
+
+        let enabled = outputs.iter().filter(|o| o.enabled).count();
+        builder
+            .cache
+            .set_window(if enabled > 1 { block_cache_window } else { 0 });
 
         let keep_until = outputs
             .iter()
@@ -544,10 +734,17 @@ async fn run(
         if tick % STATS_EVERY_N_TICKS == 0 {
             let cursors = outputs
                 .iter()
+                .filter(|o| o.enabled)
                 .map(|o| format!("{}={}/{}", o.config.name, o.cursor, o.head))
                 .collect::<Vec<_>>()
                 .join(" ");
             tracing::log::info!(target: PROJECT_ID, "Cursors {} cache {} blocks / {} bytes", cursors, builder.cache.len(), builder.cache.bytes());
+            // Once the optimistic output is running we leave it running rather than flapping it,
+            // but a backlog that re-opens means the machine is no longer keeping up.
+            let gap = outputs[0].head.saturating_sub(outputs[0].cursor);
+            if outputs.len() > 1 && outputs[1].enabled && gap > optimistic_enable_threshold {
+                tracing::log::error!(target: PROJECT_ID, "[{}] is {} blocks behind its head (threshold {}) while [{}] is running", outputs[0].config.name, gap, optimistic_enable_threshold, outputs[1].config.name);
+            }
         }
     }
 }
