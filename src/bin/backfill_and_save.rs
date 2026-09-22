@@ -133,6 +133,7 @@ fn main() {
         validate_genesis: false,
         interval: Duration::from_millis(250),
         finality: Default::default(),
+        skip_broken_blocks: false,
     };
 
     let args = env::args().collect::<Vec<String>>();

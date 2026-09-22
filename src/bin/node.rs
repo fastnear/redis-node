@@ -364,10 +364,12 @@ impl Builder {
             };
 
             let bytes = Arc::new(
-                serde_json::to_vec(&streamer_message).expect("Failed to serialize streamer message"),
+                serde_json::to_vec(&streamer_message)
+                    .expect("Failed to serialize streamer message"),
             );
             if use_cache {
-                self.cache.admit(block_height, block_hash, &bytes, keep_until);
+                self.cache
+                    .admit(block_height, block_hash, &bytes, keep_until);
             }
             return Some((block_hash, bytes));
         }
@@ -587,6 +589,7 @@ fn main() {
                     validate_genesis: false,
                     interval: sweep_interval,
                     finality: finality.clone(),
+                    skip_broken_blocks: false,
                 };
 
                 let indexer = near_indexer::Indexer::new(indexer_config).await.expect("Failed to create indexer");
@@ -806,8 +809,7 @@ async fn run(
     block_cache_window: u64,
 ) {
     debug_assert!(
-        outputs.len() <= 2
-            && (outputs.len() < 2 || outputs[1].config.finality == Finality::None),
+        outputs.len() <= 2 && (outputs.len() < 2 || outputs[1].config.finality == Finality::None),
         "outputs[0] is the primary stream and outputs[1], when present, is the optimistic one"
     );
     let mut tick: u64 = 0;
@@ -902,8 +904,9 @@ async fn advance(
 ) {
     let mut block_height = output.cursor;
     while block_height <= output.head {
-        if let Some((_block_hash, bytes)) =
-            builder.get_or_build(block_height, keep_until, use_cache).await
+        if let Some((_block_hash, bytes)) = builder
+            .get_or_build(block_height, keep_until, use_cache)
+            .await
         {
             emit_block(output, db, log_file, &bytes).await;
             output.cursor = block_height + 1;
@@ -990,9 +993,12 @@ async fn emit_block(output: &mut Output, db: &mut RedisDB, log_file: &mut File, 
             .join(", ");
         tracing::log::warn!(target: PROJECT_ID, "[{}] Block {} is missing some tx hashes for receipts: [{}]", output.config.name, block_height, hashes_str);
         if past_watermark
-            && receipts_with_missing_tx_hashes
-                .iter()
-                .any(|r| !output.config.missing_receipts_whitelist.contains(&r.receipt_id))
+            && receipts_with_missing_tx_hashes.iter().any(|r| {
+                !output
+                    .config
+                    .missing_receipts_whitelist
+                    .contains(&r.receipt_id)
+            })
         {
             tracing::log::error!(target: PROJECT_ID, "[{}] Block {} is missing some tx hashes for receipts: [{:?}]", output.config.name, block_height, receipts_with_missing_tx_hashes);
             if output.config.fatal_on_missing_tx_hashes {
@@ -1135,7 +1141,12 @@ mod tests {
         Arc::new(vec![0u8; len])
     }
 
-    fn output(name: &'static str, finality: Finality, cursor: BlockHeight, head: BlockHeight) -> Output {
+    fn output(
+        name: &'static str,
+        finality: Finality,
+        cursor: BlockHeight,
+        head: BlockHeight,
+    ) -> Output {
         let mut o = Output::new(
             OutputConfig {
                 name,
@@ -1261,8 +1272,15 @@ mod tests {
         // Node has not reached what we already streamed: catching up, not caught up.
         primary.head = 800;
         assert_eq!(remaining_work(&primary), None);
-        assert!(!should_activate_optimistic(remaining_work(&primary), 0, 200));
-        assert!(optimistic_is_crowding_primary(remaining_work(&primary), 200));
+        assert!(!should_activate_optimistic(
+            remaining_work(&primary),
+            0,
+            200
+        ));
+        assert!(optimistic_is_crowding_primary(
+            remaining_work(&primary),
+            200
+        ));
     }
 
     /// A stale head means the node is still syncing, however little the cursor has left to do.
