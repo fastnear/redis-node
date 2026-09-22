@@ -75,6 +75,7 @@ impl RedisDB {
     pub async fn xread(
         &mut self,
         count: usize,
+        block_ms: usize,
         key: &str,
         id: &str,
     ) -> redis::RedisResult<Vec<(String, Vec<(String, String)>)>> {
@@ -82,14 +83,17 @@ impl RedisDB {
             .arg("COUNT")
             .arg(count)
             .arg("BLOCK")
-            .arg(0)
+            .arg(block_ms)
             .arg("STREAMS")
             .arg(key)
             .arg(id)
             .query_async(&mut self.connection)
             .await?;
         // Taking the first stream
-        let stream = streams.into_iter().next().unwrap();
+        let stream = match streams.into_iter().next() {
+            Some(stream) => stream,
+            None => return Ok(vec![]),
+        };
         Ok(stream
             .entries
             .into_iter()

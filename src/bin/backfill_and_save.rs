@@ -1,13 +1,11 @@
-mod block_with_tx_hash;
 mod common;
 
-use crate::block_with_tx_hash::BlockWithTxHashes;
 use dotenv::dotenv;
-use near_indexer::near_primitives::hash::CryptoHash;
-use near_indexer::near_primitives::types::BlockHeight;
+use fastnear_primitives::block_with_tx_hash::BlockWithTxHashes;
+use fastnear_primitives::near_primitives::hash::CryptoHash;
+use fastnear_primitives::near_primitives::types::BlockHeight;
 use near_indexer::streamer::build_streamer_message;
-use near_indexer::streamer::fetchers::fetch_block_by_height;
-use near_indexer::{Indexer, StreamerMessage};
+use near_indexer::Indexer;
 use std::collections::HashMap;
 use std::time::Duration;
 use std::{env, fs};
@@ -115,6 +113,7 @@ fn process_block(
 }
 
 fn main() {
+    #[allow(deprecated)]
     openssl_probe::init_ssl_cert_env_vars();
     dotenv().ok();
 
@@ -132,7 +131,7 @@ fn main() {
         sync_mode: near_indexer::SyncModeEnum::FromInterruption,
         await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
         validate_genesis: false,
-        interval: Duration::from_millis(500),
+        interval: Duration::from_millis(250),
         finality: Default::default(),
     };
 
@@ -144,7 +143,9 @@ fn main() {
 
     let sys = actix::System::new();
     sys.block_on(async move {
-        let indexer = near_indexer::Indexer::new(indexer_config).unwrap();
+        let indexer = near_indexer::Indexer::new(indexer_config)
+            .await
+            .expect("Failed to create indexer");
         let stream = streamer(indexer, start_block_height, end_block_height);
         listen_blocks(
             stream,
@@ -161,19 +162,22 @@ fn main() {
 }
 async fn start(
     indexer: Indexer,
-    block_sink: mpsc::Sender<StreamerMessage>,
+    block_sink: mpsc::Sender<BlockWithTxHashes>,
     start_block_height: BlockHeight,
     end_block_height: BlockHeight,
 ) {
     // Reading the input file
     let view_client = indexer.view_client.clone();
     for block_height in start_block_height - RECEIPT_BACKFILL_DEPTH..end_block_height {
-        let block = fetch_block_by_height(&view_client, block_height).await;
-        if let Ok(block) = block {
+        let block = view_client.fetch_block_by_height(block_height).await;
+        if let Ok(Some(block)) = block {
             let response =
                 build_streamer_message(&view_client, block, &indexer.shard_tracker).await;
             if let Ok(response) = response {
-                block_sink.send(response).await.unwrap();
+                let fastnear_streamer_message: fastnear_primitives::near_indexer_primitives::StreamerMessage =
+                    serde_json::from_slice(&serde_json::to_vec(&response).unwrap()).unwrap();
+                let block: BlockWithTxHashes = fastnear_streamer_message.into();
+                block_sink.send(block).await.unwrap();
             } else {
                 tracing::warn!(target: PROJECT_ID, "Failed to build block {}", block_height);
             }
@@ -187,7 +191,7 @@ fn streamer(
     indexer: Indexer,
     start_block_height: BlockHeight,
     end_block_height: BlockHeight,
-) -> mpsc::Receiver<StreamerMessage> {
+) -> mpsc::Receiver<BlockWithTxHashes> {
     let (sender, receiver) = mpsc::channel(100);
     actix::spawn(start(indexer, sender, start_block_height, end_block_height));
     receiver
@@ -231,7 +235,7 @@ fn save_blocks(
 }
 
 async fn listen_blocks(
-    mut stream: mpsc::Receiver<StreamerMessage>,
+    mut stream: mpsc::Receiver<BlockWithTxHashes>,
     mut tx_cache: TxCache,
     save_path: Option<String>,
     save_every_n: u64,
@@ -240,11 +244,10 @@ async fn listen_blocks(
     let mut blocks = vec![];
     let mut last_block_height = None;
 
-    while let Some(streamer_message) = stream.recv().await {
-        let block_height = streamer_message.block.header.height;
+    while let Some(mut block) = stream.recv().await {
+        let block_height = block.block.header.height;
         tracing::info!(target: PROJECT_ID, "Processing block: {}", block_height);
 
-        let mut block: BlockWithTxHashes = streamer_message.into();
         let has_all_tx_hashes = process_block(&mut tx_cache, &mut block, last_block_height);
         last_block_height = Some(block_height);
 
