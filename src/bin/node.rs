@@ -1,3 +1,31 @@
+//! Streams blocks out of an embedded `neard` node into one or two Redis streams.
+//!
+//! A single process can serve several finalities at once, because `finality` only picks the head
+//! a sweep runs up to - every block below it is fetched by height from the canonical index and
+//! built by the same code. Set `OPTIMISTIC_BLOCKS_KEY` to get the chain head alongside the final
+//! stream instead of running a second node for it.
+//!
+//! Environment:
+//!   REDIS_URL                     single URL (no commas - only `caching-saver` splits them)
+//!   BLOCKS_KEY                    stream key for the primary output
+//!   FINALITY                      JSON string: "final" | "near-final" | "optimistic"
+//!   STREAM_TO_REDIS               "true" to actually XADD
+//!   MAX_NUM_BLOCKS                XADD MAXLEN ~ N
+//!   START_BLOCK                   where to start when the stream is empty
+//!   RECEIPT_BACKFILL_DEPTH        blocks replayed to warm the receipt -> tx map (default 250)
+//!   MISSING_RECEIPTS_WHITELIST    receipt ids allowed to have no tx hash
+//!   LOG_BLOCKS                    write res/blocks_log.csv (default: STREAM_TO_REDIS)
+//!   SWEEP_INTERVAL_MS             poll interval (default 50)
+//!   NEARDATA_CHAIN_ID             "mainnet" | "testnet", falls back to CHAIN_ID
+//!
+//!   OPTIMISTIC_BLOCKS_KEY         set to also stream the chain head to this key
+//!   OPTIMISTIC_MAX_NUM_BLOCKS     MAXLEN for that stream (default: MAX_NUM_BLOCKS)
+//!   OPTIMISTIC_ENABLE_THRESHOLD   how close the primary output must be to its head before the
+//!                                 optimistic one starts (default 200)
+//!   BLOCK_CACHE_WINDOW            blocks kept for the second output to reuse (default 64,
+//!                                 0 disables the cache)
+//!   BLOCK_CACHE_MAX_BYTES         cache backstop (default 256 MiB)
+
 use std::io::Write;
 mod common;
 mod redis_db;
@@ -8,11 +36,14 @@ use fastnear_primitives::block_with_tx_hash::BlockWithTxHashes;
 use fastnear_primitives::near_primitives::hash::hash;
 use fastnear_primitives::near_primitives::hash::CryptoHash;
 use fastnear_primitives::near_primitives::views::ReceiptView;
+use near_indexer::near_primitives::hash::CryptoHash as BlockHash;
 use near_indexer::near_primitives::types::{BlockHeight, Finality};
 use redis_db::RedisDB;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{create_dir_all, File, OpenOptions};
+use std::sync::Arc;
+use std::time::Duration;
 
 pub type BlockHashes = Vec<CryptoHash>;
 
@@ -30,13 +61,47 @@ const OPTIMISTIC_DEPTH: u64 = 10;
 /// reorgs when streaming optimistic blocks.
 const RECEIPT_HASH_CLEANUP_BLOCKS: u64 = 10;
 
-pub struct Config {
-    pub stream_to_redis: bool,
-    pub max_num_blocks: Option<usize>,
-    pub blocks_key: String,
-    pub finality: Finality,
-    pub log_file: File,
-}
+/// How many times to retry fetching or building a single block before giving up.
+///
+/// `near_indexer::streamer::start` logged and *skipped* a block on error, which then tripped the
+/// skipped-block assert in `emit_block` on the next block and crash-looped the process. Now that
+/// we drive the sweep ourselves we retry instead, which is strictly better.
+const MAX_BUILD_RETRIES: usize = 10;
+
+const DEFAULT_SWEEP_INTERVAL_MS: u64 = 50;
+
+/// How far the primary output may lag its head before the optimistic output is allowed to start.
+const DEFAULT_OPTIMISTIC_ENABLE_THRESHOLD: u64 = 200;
+
+/// How many blocks ahead of the slowest cursor a built block is still worth caching.
+const DEFAULT_BLOCK_CACHE_WINDOW: u64 = 64;
+
+/// Backstop on the block cache. Typical mainnet blocks are 100-500 KB of JSON, so the window is
+/// normally the binding constraint and this only matters on a run of unusually large blocks.
+const DEFAULT_BLOCK_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
+
+/// How far behind its head an output has to be before it counts as backfilling rather than live.
+const BACKFILL_GAP: u64 = 32;
+
+/// Multiple of `OPTIMISTIC_ENABLE_THRESHOLD` at which a running optimistic output is shed so the
+/// primary can catch up alone.
+const OPTIMISTIC_DISABLE_MULTIPLIER: u64 = 4;
+
+/// How old the primary's head block may be for the node to count as caught up with the network.
+/// Threshold width alone is not enough to keep the gate stable: starting the optimistic output is
+/// itself what makes the primary lag, so a purely cursor-based gate oscillates. Head age moves on
+/// the timescale of syncing rather than of one sweep, which is what actually settles it.
+const OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS: u64 = 30;
+
+/// Consecutive ticks the primary must stay over the shed threshold before we shed, and how long to
+/// wait afterwards before reconsidering. At the default 50ms interval that is 5s of sustained
+/// overload and a 30s cooldown - the optimistic output re-anchors and replays ~260 blocks every
+/// time it starts, so starting it must never be cheap to trigger.
+const OPTIMISTIC_SHED_TICKS: u32 = 100;
+const OPTIMISTIC_COOLDOWN_TICKS: u64 = 600;
+
+/// How often (in sweep ticks) to log cursor/cache stats.
+const STATS_EVERY_N_TICKS: u64 = 200;
 
 #[derive(Default)]
 pub struct TxCache {
@@ -84,10 +149,19 @@ impl TxCache {
 
 async fn last_neardata_block_height() -> BlockHeight {
     let client = reqwest::Client::new();
-    let chain_id = fastnear_primitives::types::ChainId::try_from(
-        env::var("CHAIN_ID").expect("CHAIN_ID is not set"),
-    )
-    .expect("Invalid chain id");
+    // `CHAIN_ID` is overloaded: `caching-saver` uses it as a raw Redis key prefix and may legally
+    // be set to something like `mainnet_opt`, which `ChainId::try_from` rejects. `NEARDATA_CHAIN_ID`
+    // lets the two binaries share an env file.
+    let raw_chain_id = env::var("NEARDATA_CHAIN_ID")
+        .or_else(|_| env::var("CHAIN_ID"))
+        .expect("Neither NEARDATA_CHAIN_ID nor CHAIN_ID is set");
+    let chain_id = fastnear_primitives::types::ChainId::try_from(raw_chain_id.clone())
+        .unwrap_or_else(|_| {
+            panic!(
+                "Invalid neardata chain id {:?}. Set NEARDATA_CHAIN_ID to `mainnet` or `testnet`.",
+                raw_chain_id
+            )
+        });
     let last_block_height = fetcher::fetch_last_block(&client, chain_id)
         .await
         .expect("Last block doesn't exists")
@@ -95,6 +169,281 @@ async fn last_neardata_block_height() -> BlockHeight {
         .header
         .height;
     last_block_height
+}
+
+/// Cache of built `StreamerMessage`s, serialized once and keyed by **block hash**.
+///
+/// Keying by hash rather than height is load-bearing. A reorg rewrites the canonical height index,
+/// so the same height can resolve to a different block over time; a hash miss is exactly the signal
+/// that the block at that height changed and has to be rebuilt.
+#[derive(Default)]
+pub struct BlockCache {
+    by_hash: HashMap<BlockHash, Arc<Vec<u8>>>,
+    /// One-to-many on purpose: after a reorg two hashes share a height, and a
+    /// `HashMap<BlockHeight, BlockHash>` would silently drop the orphan and leak it in `by_hash`.
+    heights: BTreeMap<BlockHeight, Vec<BlockHash>>,
+    bytes: usize,
+    /// Admission window, in blocks ahead of the slowest output's cursor. Admission is the right
+    /// knob here rather than eviction: any normal eviction policy drops the *lowest* heights,
+    /// which is precisely what the lagging output needs next. `0` disables caching entirely.
+    window: u64,
+    max_bytes: usize,
+}
+
+impl BlockCache {
+    pub fn new(window: u64, max_bytes: usize) -> Self {
+        Self {
+            window,
+            max_bytes,
+            ..Default::default()
+        }
+    }
+
+    pub fn get(&self, block_hash: &BlockHash) -> Option<Arc<Vec<u8>>> {
+        self.by_hash.get(block_hash).cloned()
+    }
+
+    pub fn admit(
+        &mut self,
+        block_height: BlockHeight,
+        block_hash: BlockHash,
+        bytes: &Arc<Vec<u8>>,
+        keep_until: BlockHeight,
+    ) {
+        if self.window == 0
+            || block_height > keep_until.saturating_add(self.window)
+            || self.bytes + bytes.len() > self.max_bytes
+            || self.by_hash.contains_key(&block_hash)
+        {
+            return;
+        }
+        self.bytes += bytes.len();
+        self.by_hash.insert(block_hash, Arc::clone(bytes));
+        self.heights
+            .entry(block_height)
+            .or_default()
+            .push(block_hash);
+    }
+
+    pub fn prune_below(&mut self, block_height: BlockHeight) {
+        if self.by_hash.is_empty() {
+            return;
+        }
+        let keep = self.heights.split_off(&block_height);
+        let dropped = std::mem::replace(&mut self.heights, keep);
+        for (_, block_hashes) in dropped {
+            for block_hash in block_hashes {
+                if let Some(bytes) = self.by_hash.remove(&block_hash) {
+                    self.bytes = self.bytes.saturating_sub(bytes.len());
+                }
+            }
+        }
+    }
+
+    /// The cache only earns its keep while two outputs are actually sweeping. Setting the window
+    /// to 0 (single output, or the optimistic output still held off) makes it provably inert.
+    pub fn set_window(&mut self, window: u64) {
+        if window == self.window {
+            return;
+        }
+        self.window = window;
+        if window == 0 {
+            self.by_hash.clear();
+            self.heights.clear();
+            self.bytes = 0;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.by_hash.len()
+    }
+
+    pub fn bytes(&self) -> usize {
+        self.bytes
+    }
+}
+
+/// Builds (or serves from cache) one block at a time, shared by every output.
+///
+/// It owns the whole `near_indexer::Indexer` rather than destructuring it: the third argument of
+/// `build_streamer_message` is a `near_epoch_manager::shard_tracker::ShardTracker`, and
+/// `near-epoch-manager` is not a dependency of this crate, so that type cannot be named here.
+/// Passing `&self.indexer.shard_tracker` inline sidesteps it (same trick as `backfill_and_save.rs`).
+///
+/// NOTE: we deliberately never call `indexer.streamer()`. Driving the sweep here is what lets a
+/// single process serve several finalities: `streamer::start` opens `<home>/data/indexer` with
+/// `DB::open_default` (a second open panics) and relies on nearcore's process-global
+/// `DELAYED_LOCAL_RECEIPTS_CACHE`, whose destructive `remove()` breaks if two builders race.
+///
+/// In steady state each (height, hash) is built exactly once and the second output reads the
+/// cache, so that global map sees the same insert/remove pairing a single-finality node produces.
+/// That is not true in general - an output further behind than `BLOCK_CACHE_WINDOW` gets no cache
+/// hits - which is why `run` makes a backfilling output bypass the cache and rebuild contiguously
+/// rather than alternate between hits and misses.
+pub struct Builder {
+    indexer: near_indexer::Indexer,
+    cache: BlockCache,
+}
+
+impl Builder {
+    pub fn new(indexer: near_indexer::Indexer, cache: BlockCache) -> Self {
+        Self { indexer, cache }
+    }
+
+    /// Current head height at the given finality. `Finality::None` is the (reorg-able) chain head,
+    /// `Finality::Final` the final head. This is the *only* thing finality controls.
+    pub async fn head(&self, finality: &Finality) -> Option<(BlockHeight, u64)> {
+        match self
+            .indexer
+            .view_client
+            .fetch_latest_block(finality.clone())
+            .await
+        {
+            Ok(block) => Some((block.header.height, block.header.timestamp)),
+            Err(err) => {
+                tracing::log::warn!(target: PROJECT_ID, "Failed to fetch latest block at {:?}: {:?}", finality, err);
+                None
+            }
+        }
+    }
+
+    /// Returns the serialized `StreamerMessage` for the canonical block at `block_height`, building
+    /// it if it isn't cached. `None` means there is no block at that height (a skipped height).
+    ///
+    /// The `fetch_block_by_height` round trip is paid by every output on every block and is what
+    /// makes reorgs safe: it re-resolves the canonical hash before the cache is consulted.
+    pub async fn get_or_build(
+        &mut self,
+        block_height: BlockHeight,
+        keep_until: BlockHeight,
+        use_cache: bool,
+    ) -> Option<(BlockHash, Arc<Vec<u8>>)> {
+        let mut delay = Duration::from_millis(INITIAL_RETRY_DELAY);
+        for attempt in 0..MAX_BUILD_RETRIES {
+            let block = match self
+                .indexer
+                .view_client
+                .fetch_block_by_height(block_height)
+                .await
+            {
+                Ok(Some(block)) => block,
+                Ok(None) => {
+                    tracing::log::debug!(target: PROJECT_ID, "Skipping height {} - no block", block_height);
+                    return None;
+                }
+                Err(err) => {
+                    tracing::log::warn!(target: PROJECT_ID, "Attempt #{} failed to fetch block {}: {:?}", attempt, block_height, err);
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    continue;
+                }
+            };
+
+            let block_hash = block.header.hash;
+            if use_cache {
+                if let Some(bytes) = self.cache.get(&block_hash) {
+                    return Some((block_hash, bytes));
+                }
+            }
+
+            // Boxed because the future is large - `near_indexer::streamer::start` boxes it too.
+            let streamer_message = match Box::pin(near_indexer::build_streamer_message(
+                &self.indexer.view_client,
+                block,
+                &self.indexer.shard_tracker,
+            ))
+            .await
+            {
+                Ok(streamer_message) => streamer_message,
+                Err(err) => {
+                    tracing::log::warn!(target: PROJECT_ID, "Attempt #{} failed to build block {}: {:?}", attempt, block_height, err);
+                    tokio::time::sleep(delay).await;
+                    delay *= 2;
+                    continue;
+                }
+            };
+
+            let bytes = Arc::new(
+                serde_json::to_vec(&streamer_message).expect("Failed to serialize streamer message"),
+            );
+            if use_cache {
+                self.cache.admit(block_height, block_hash, &bytes, keep_until);
+            }
+            return Some((block_hash, bytes));
+        }
+        panic!(
+            "Failed to fetch or build block {} after {} attempts",
+            block_height, MAX_BUILD_RETRIES
+        );
+    }
+}
+
+/// Immutable configuration of one output stream.
+pub struct OutputConfig {
+    /// Short label used in logs to tell the outputs apart.
+    pub name: &'static str,
+    pub blocks_key: String,
+    /// Only ever used to pick this output's head height.
+    pub finality: Finality,
+    pub max_num_blocks: Option<usize>,
+    pub stream_to_redis: bool,
+    pub log_blocks: bool,
+    /// Whether a prev-hash mismatch is fatal. Optimistic streams see reorgs by design.
+    pub strict_hash_check: bool,
+    /// Whether exhausting the Redis write retries kills the process. Final streams must not have
+    /// gaps (`caching-saver` assumes contiguity); the optimistic stream tolerates them.
+    pub fatal_on_redis_failure: bool,
+    /// Whether a receipt with no known tx hash kills the process. A stream that follows the chain
+    /// head necessarily has an incomplete tx map: after a reorg its cursor has already passed the
+    /// replaced heights, so transactions that only exist on the new fork were never recorded, and
+    /// their receipts legitimately resolve to `None` a few blocks later.
+    pub fatal_on_missing_tx_hashes: bool,
+    pub receipt_backfill_depth: u64,
+    pub missing_receipts_whitelist: Arc<HashSet<CryptoHash>>,
+}
+
+/// Mutable per-output state.
+pub struct Output {
+    pub config: OutputConfig,
+    /// Never shared between outputs: an optimistic cache legitimately holds receipts from abandoned
+    /// fork blocks, which would trip `store_receipt_to_tx`'s assert in another output.
+    pub tx_cache: TxCache,
+    /// Next height to consider.
+    pub cursor: BlockHeight,
+    /// Blocks at or below this are warm-up: already in Redis, so not re-emitted, and allowed to be
+    /// missing tx hashes.
+    pub redis_watermark: BlockHeight,
+    pub expected_block_height: BlockHeight,
+    pub last_block_height: Option<BlockHeight>,
+    pub last_block_hash: Option<CryptoHash>,
+    /// Refreshed once per sweep tick.
+    pub head: BlockHeight,
+    /// Timestamp (unix nanos) of the block at `head`, for judging whether the node is caught up.
+    pub head_timestamp: u64,
+    pub enabled: bool,
+    /// Consecutive ticks this output has been over the shed threshold.
+    pub shed_streak: u32,
+    /// Tick before which a shed output must not be reconsidered.
+    pub reactivate_after_tick: u64,
+}
+
+impl Output {
+    pub fn new(config: OutputConfig, cursor: BlockHeight, redis_watermark: BlockHeight) -> Self {
+        Self {
+            config,
+            tx_cache: TxCache::default(),
+            cursor,
+            redis_watermark,
+            expected_block_height: cursor,
+            last_block_height: None,
+            last_block_hash: None,
+            head: 0,
+            head_timestamp: 0,
+            enabled: true,
+            shed_streak: 0,
+            reactivate_after_tick: 0,
+        }
+    }
 }
 
 fn main() {
@@ -112,6 +461,7 @@ fn main() {
                 .collect()
         })
         .unwrap_or_default();
+    let missing_receipts_whitelist = Arc::new(missing_receipts_whitelist);
     let receipt_backfill_depth = env::var("RECEIPT_BACKFILL_DEPTH")
         .map(|s| s.parse().unwrap())
         .unwrap_or(RECEIPT_BACKFILL_DEPTH);
@@ -119,8 +469,56 @@ fn main() {
         serde_json::from_str(&env::var("FINALITY").expect("Missing FINALITY env var"))
             .expect("Failed to parse Finality");
     let blocks_key = env::var("BLOCKS_KEY").expect("Missing BLOCKS_KEY env var");
+    let stream_to_redis =
+        env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var") == "true";
+    let log_blocks = env::var("LOG_BLOCKS")
+        .map(|s| s == "true")
+        .unwrap_or(stream_to_redis);
+    let max_num_blocks = env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok();
+    let sweep_interval = Duration::from_millis(
+        env::var("SWEEP_INTERVAL_MS")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(DEFAULT_SWEEP_INTERVAL_MS),
+    );
 
-    let tx_cache = TxCache::default();
+    // Setting OPTIMISTIC_BLOCKS_KEY is what turns this into a two-stream node.
+    let optimistic_blocks_key = env::var("OPTIMISTIC_BLOCKS_KEY")
+        .ok()
+        .filter(|s| !s.is_empty());
+    if let Some(optimistic_blocks_key) = optimistic_blocks_key.as_ref() {
+        assert_ne!(
+            optimistic_blocks_key, &blocks_key,
+            "BLOCKS_KEY and OPTIMISTIC_BLOCKS_KEY must differ. Pointing both sweeps at one stream \
+             would silently drop half the blocks: the second write of each height comes back as \
+             `The ID specified in XADD is equal or smaller ...`, which we treat as a benign duplicate."
+        );
+        assert_ne!(
+            finality,
+            Finality::None,
+            "FINALITY must not be `optimistic` when OPTIMISTIC_BLOCKS_KEY is set, otherwise both \
+             outputs would sweep the same head."
+        );
+    }
+    let optimistic_max_num_blocks = env::var("OPTIMISTIC_MAX_NUM_BLOCKS")
+        .map(|s| s.parse().unwrap())
+        .ok()
+        .or(max_num_blocks);
+    let optimistic_enable_threshold = env::var("OPTIMISTIC_ENABLE_THRESHOLD")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_OPTIMISTIC_ENABLE_THRESHOLD);
+    let block_cache_window = env::var("BLOCK_CACHE_WINDOW")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_BLOCK_CACHE_WINDOW);
+    let block_cache_max_bytes = env::var("BLOCK_CACHE_MAX_BYTES")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_BLOCK_CACHE_MAX_BYTES);
+
+    // `RedisDB::new` hands the whole string to `Client::open`; only `caching-saver` splits on `,`.
+    let redis_url = env::var("REDIS_URL").expect("Missing REDIS_URL env var");
+    assert!(
+        !redis_url.contains(','),
+        "REDIS_URL must be a single URL for `node` (only `caching-saver` accepts a comma-separated list)"
+    );
 
     let args: Vec<String> = std::env::args().collect();
     let home_dir = std::path::PathBuf::from(near_indexer::get_default_home());
@@ -142,15 +540,6 @@ fn main() {
         .open("res/blocks_log.csv")
         .expect("Failed to create a log file");
 
-    let config = Config {
-        stream_to_redis: env::var("STREAM_TO_REDIS").expect("Missing STREAM_TO_REDIS env var")
-            == "true",
-        max_num_blocks: env::var("MAX_NUM_BLOCKS").map(|s| s.parse().unwrap()).ok(),
-        blocks_key,
-        finality: finality.clone(),
-        log_file,
-    };
-
     let start_block: Option<BlockHeight> = env::var("START_BLOCK").ok().map(|s| s.parse().unwrap());
 
     match command {
@@ -158,7 +547,7 @@ fn main() {
             let sys = actix::System::new();
             sys.block_on(async move {
                 let mut db = RedisDB::new(None).await.unwrap();
-                let last_id = db.last_id(&config.blocks_key).await.unwrap();
+                let last_id = db.last_id(&blocks_key).await.unwrap();
                 let mut last_redis_block_height: Option<BlockHeight> = last_id
                     .as_ref()
                     .map(|id| id.split_once("-").unwrap().0.parse().unwrap());
@@ -186,31 +575,81 @@ fn main() {
                     start_block_height - receipt_backfill_depth - 1
                 };
 
-
-                let sync_mode = near_indexer::SyncModeEnum::BlockHeight(expected_block_height);
                 tracing::log::info!(target: PROJECT_ID, "Redis at block height: {:?}", last_redis_block_height);
-                tracing::log::info!(target: PROJECT_ID, "SyncMode: {:?}", sync_mode);
+                tracing::log::info!(target: PROJECT_ID, "Starting sweep at block height: {}", expected_block_height);
+
                 let indexer_config = near_indexer::IndexerConfig {
                     home_dir,
-                    sync_mode,
+                    // `sync_mode`, `finality` and `interval` only feed `streamer::start`, which we
+                    // never call. Sweeping is driven by `Builder`/`Output` below.
+                    sync_mode: near_indexer::SyncModeEnum::BlockHeight(expected_block_height),
                     await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
                     validate_genesis: false,
-                    interval: std::time::Duration::from_millis(50),
-                    finality: config.finality.clone(),
+                    interval: sweep_interval,
+                    finality: finality.clone(),
                 };
 
                 let indexer = near_indexer::Indexer::new(indexer_config).await.expect("Failed to create indexer");
-                let stream = indexer.streamer();
-                listen_blocks(
-                    stream,
-                    db,
-                    tx_cache,
-                    config,
+
+                let mut outputs = vec![Output::new(
+                    OutputConfig {
+                        name: "final",
+                        blocks_key,
+                        finality,
+                        max_num_blocks,
+                        stream_to_redis,
+                        log_blocks,
+                        strict_hash_check: true,
+                        fatal_on_redis_failure: true,
+                        fatal_on_missing_tx_hashes: true,
+                        receipt_backfill_depth,
+                        missing_receipts_whitelist: Arc::clone(&missing_receipts_whitelist),
+                    },
                     expected_block_height,
-                    last_redis_block_height,
-                    missing_receipts_whitelist
+                    last_redis_block_height.unwrap_or(0),
+                )];
+
+                if let Some(optimistic_blocks_key) = optimistic_blocks_key {
+                    let mut optimistic = Output::new(
+                        OutputConfig {
+                            name: "optimistic",
+                            blocks_key: optimistic_blocks_key,
+                            finality: Finality::None,
+                            max_num_blocks: optimistic_max_num_blocks,
+                            stream_to_redis,
+                            log_blocks,
+                            // Streaming the chain head means seeing reorgs; that is the point.
+                            strict_hash_check: false,
+                            // Neither of these may take the final stream down with it: the process
+                            // aborts on panic, so an optimistic-only failure would cost a full
+                            // neard restart plus a 250-block final backfill.
+                            fatal_on_redis_failure: false,
+                            fatal_on_missing_tx_hashes: false,
+                            receipt_backfill_depth,
+                            missing_receipts_whitelist: Arc::clone(&missing_receipts_whitelist),
+                        },
+                        0,
+                        0,
+                    );
+                    // Anchored by `maybe_activate_optimistic` once the final output has caught up.
+                    optimistic.enabled = false;
+                    outputs.push(optimistic);
+                }
+
+                // `run` turns the window on only once two outputs are actually sweeping.
+                let block_cache_window = if outputs.len() > 1 { block_cache_window } else { 0 };
+                let builder = Builder::new(indexer, BlockCache::new(0, block_cache_max_bytes));
+
+                run(
+                    builder,
+                    outputs,
+                    db,
+                    log_file,
+                    sweep_interval,
+                    optimistic_enable_threshold,
+                    block_cache_window,
                 )
-                    .await;
+                .await;
 
                 actix::System::current().stop();
             });
@@ -220,129 +659,417 @@ fn main() {
     }
 }
 
-async fn listen_blocks(
-    mut stream: tokio::sync::mpsc::Receiver<near_indexer::StreamerMessage>,
-    mut db: RedisDB,
-    mut tx_cache: TxCache,
-    mut config: Config,
-    mut expected_block_height: BlockHeight,
-    last_redis_block_height: Option<BlockHeight>,
-    missing_receipts_whitelist: HashSet<CryptoHash>,
+/// Blocks still to sweep before this output is level with its head.
+///
+/// `Some(0)` is the caught-up state: the cursor sits one past the last block emitted, and that
+/// block is the head. That is why the bound is `head + 1` and not `head` - comparing against
+/// `head` reports the normal steady state as underflow. `None` means the cursor is beyond the head
+/// entirely, i.e. the node has not reached what we already streamed, which is the opposite of
+/// caught up and must never read as zero work.
+fn remaining_work(output: &Output) -> Option<BlockHeight> {
+    output.head.saturating_add(1).checked_sub(output.cursor)
+}
+
+/// Age of the block at this output's head, in seconds. Large while the node is syncing.
+fn head_age_secs(output: &Output) -> u64 {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    now.saturating_sub(output.head_timestamp) / 1_000_000_000
+}
+
+/// Whether the primary has little enough left to do, and a recent enough head, to let the
+/// optimistic output start. `None` work means the node has not reached what we streamed, which is
+/// never close enough.
+fn should_activate_optimistic(
+    work: Option<BlockHeight>,
+    head_age_secs: u64,
+    threshold: u64,
+) -> bool {
+    matches!(work, Some(work) if work <= threshold)
+        && head_age_secs <= OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS
+}
+
+/// Whether the primary is overloaded this tick, counting towards shedding the optimistic output.
+/// Shedding only happens once this has held for `OPTIMISTIC_SHED_TICKS` ticks in a row.
+fn optimistic_is_crowding_primary(work: Option<BlockHeight>, threshold: u64) -> bool {
+    !matches!(work, Some(work) if work <= threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER))
+}
+
+fn describe_work(work: Option<BlockHeight>) -> String {
+    match work {
+        Some(work) => format!("{} blocks behind its head", work),
+        None => "ahead of its own node's head".to_string(),
+    }
+}
+
+/// Sweep order: outputs that are up to date go first, so a backfill (notably the ~260 blocks the
+/// optimistic output replays when it activates) never sits in front of somebody's live block.
+/// Among those, lowest finality first, because `Finality::None` is the latency-sensitive stream.
+///
+/// This is only a preference. Both outputs share one symmetric `get_or_build`, so whichever
+/// reaches a height first pays to build it and correctness never depends on the order.
+fn priority_order(outputs: &[Output]) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..outputs.len()).collect();
+    order.sort_by_key(|&i| {
+        let backfilling = remaining_work(&outputs[i]).is_some_and(|work| work > BACKFILL_GAP);
+        let finality_rank = match outputs[i].config.finality {
+            Finality::None => 0,
+            Finality::DoomSlug => 1,
+            Finality::Final => 2,
+        };
+        (backfilling, finality_rank)
+    });
+    order
+}
+
+/// The optimistic stream has no completeness contract - it already re-anchors near the head on
+/// every restart - so while the primary output has a real backlog we don't run it at all and spend
+/// the whole machine on catching up. Capping work per tick would not help: the cost is
+/// `build_streamer_message`, and at a 50ms interval any per-tick budget asks for more seconds of
+/// work than there are seconds of wall clock.
+///
+/// Activation anchors on the node's *local* head rather than neardata. By this point the node is
+/// caught up, so the local head is the better anchor, and it keeps startup off
+/// `fetch_block_until_success`, which retries forever with no overall timeout - a neardata outage
+/// would otherwise hang the whole process and neither stream would start.
+async fn update_optimistic_gate(
+    builder: &Builder,
+    outputs: &mut [Output],
+    threshold: u64,
+    tick: u64,
 ) {
-    let redis_block = last_redis_block_height.unwrap_or(0);
-    let mut last_block_height = None;
-    let mut last_block_hash = None;
-    while let Some(streamer_message) = stream.recv().await {
-        let fastnear_streamer_message: fastnear_primitives::near_indexer_primitives::StreamerMessage =
-            serde_json::from_slice(&serde_json::to_vec(&streamer_message).unwrap()).unwrap();
-        let mut block: BlockWithTxHashes = fastnear_streamer_message.into();
-        let block_height = block.block.header.height;
-        let prev_block_height = block.block.header.prev_height;
-        if let Some(prev_block_height) = prev_block_height {
-            assert!(
-                expected_block_height > prev_block_height,
-                "The indexer skipped a block. Expected block height: {}, but got: {}",
-                expected_block_height,
-                prev_block_height
-            );
+    if outputs.len() < 2 {
+        return;
+    }
+    let work = remaining_work(&outputs[0]);
+    let head_age = head_age_secs(&outputs[0]);
+
+    if outputs[1].enabled {
+        // Shed the optimistic output if the primary falls badly behind. Both outputs share one
+        // sequential task, and once they drift further apart than the cache window the second one
+        // stops hitting the cache, so staying enabled doubles the build load exactly when the
+        // machine is already losing. The primary holds the completeness contract, so it gets the
+        // machine. Shedding needs the overload to persist: a single bad tick is as likely to be
+        // the optimistic output's own activation backfill, and reacting to that oscillates.
+        if optimistic_is_crowding_primary(work, threshold) {
+            outputs[1].shed_streak += 1;
+        } else {
+            outputs[1].shed_streak = 0;
         }
-        expected_block_height = block_height + 1;
-        let prev_block_hash = block.block.header.prev_hash;
-        if let Some(last_block_hash) = last_block_hash {
-            if last_block_hash != prev_block_hash {
-                let message = format!(
-                    "Block hashes don't match at block height: {}. Last block height {:?}, prev block height {:?}. Expected: {}, got: {}",
-                    block_height,
-                    last_block_height,
-                    prev_block_height,
-                    last_block_hash,
-                    prev_block_hash
-                );
-                if config.finality == Finality::None {
-                    tracing::log::warn!(target: PROJECT_ID, "{}", message);
-                } else {
-                    tracing::log::error!(target: PROJECT_ID, "{}", message);
-                    panic!("{}", message);
-                }
+        if outputs[1].shed_streak >= OPTIMISTIC_SHED_TICKS {
+            let shed_at = threshold.saturating_mul(OPTIMISTIC_DISABLE_MULTIPLIER);
+            outputs[1].enabled = false;
+            outputs[1].shed_streak = 0;
+            outputs[1].reactivate_after_tick = tick.saturating_add(OPTIMISTIC_COOLDOWN_TICKS);
+            tracing::log::error!(target: PROJECT_ID, "[{}] disabled: [{}] stayed {} for {} ticks (shed threshold {}); giving the machine to the final stream", outputs[1].config.name, outputs[0].config.name, describe_work(work), OPTIMISTIC_SHED_TICKS, shed_at);
+        }
+        return;
+    }
+
+    if tick < outputs[1].reactivate_after_tick {
+        return;
+    }
+
+    if !should_activate_optimistic(work, head_age, threshold) {
+        if tick % STATS_EVERY_N_TICKS == 0 {
+            tracing::log::info!(target: PROJECT_ID, "[{}] holding off, [{}] is {} and its head is {}s old (thresholds {} blocks / {}s)", outputs[1].config.name, outputs[0].config.name, describe_work(work), head_age, threshold, OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS);
+        }
+        return;
+    }
+    let Some((head, head_timestamp)) = builder.head(&outputs[1].config.finality).await else {
+        return;
+    };
+    let watermark = head.saturating_sub(OPTIMISTIC_DEPTH);
+    let cursor = watermark.saturating_sub(outputs[1].config.receipt_backfill_depth + 1);
+    let optimistic = &mut outputs[1];
+    optimistic.redis_watermark = watermark;
+    optimistic.cursor = cursor;
+    optimistic.expected_block_height = cursor;
+    optimistic.last_block_height = None;
+    optimistic.last_block_hash = None;
+    optimistic.head = head;
+    optimistic.head_timestamp = head_timestamp;
+    optimistic.enabled = true;
+    optimistic.shed_streak = 0;
+    tracing::log::info!(target: PROJECT_ID, "[{}] activated at head {}: sweeping from {}, emitting above {}", optimistic.config.name, head, cursor, watermark);
+}
+
+async fn run(
+    mut builder: Builder,
+    mut outputs: Vec<Output>,
+    mut db: RedisDB,
+    mut log_file: File,
+    interval: Duration,
+    optimistic_enable_threshold: u64,
+    block_cache_window: u64,
+) {
+    debug_assert!(
+        outputs.len() <= 2
+            && (outputs.len() < 2 || outputs[1].config.finality == Finality::None),
+        "outputs[0] is the primary stream and outputs[1], when present, is the optimistic one"
+    );
+    let mut tick: u64 = 0;
+    loop {
+        tokio::time::sleep(interval).await;
+        tick += 1;
+
+        for output in outputs.iter_mut() {
+            if !output.enabled {
+                continue;
+            }
+            if let Some((head, head_timestamp)) = builder.head(&output.config.finality).await {
+                output.head = head;
+                output.head_timestamp = head_timestamp;
             }
         }
-        last_block_hash = Some(block.block.header.hash);
-        let block_timestamp = block.block.header.timestamp;
-        let current_time_ns = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos() as u64;
-        let time_diff_ns = current_time_ns.saturating_sub(block_timestamp);
-        tracing::log::info!(target: PROJECT_ID, "Processing block {}\tlatency {:.3} sec", block_height, time_diff_ns as f64 / 1e9f64);
-        let receipts_with_missing_tx_hashes =
-            process_block(&mut tx_cache, &mut block, last_block_height);
-        last_block_height = Some(block_height);
 
-        if !receipts_with_missing_tx_hashes.is_empty() {
-            let hashes_str = receipts_with_missing_tx_hashes
+        update_optimistic_gate(&builder, &mut outputs, optimistic_enable_threshold, tick).await;
+
+        let enabled = outputs.iter().filter(|o| o.enabled).count();
+        builder
+            .cache
+            .set_window(if enabled > 1 { block_cache_window } else { 0 });
+
+        let keep_until = outputs
+            .iter()
+            .filter(|o| o.enabled)
+            .map(|o| o.cursor)
+            .min()
+            .unwrap_or(0);
+        builder.cache.prune_below(keep_until);
+
+        for i in priority_order(&outputs) {
+            if !outputs[i].enabled {
+                continue;
+            }
+            // A backfilling output bypasses the cache entirely and rebuilds every block in order.
+            // Alternating cache hits and misses is the one pattern that breaks nearcore's global
+            // DELAYED_LOCAL_RECEIPTS_CACHE: a hit skips `build_streamer_message`, so the receipt
+            // that block inserts is never inserted, and the later block that consumes it finds
+            // nothing and falls into a 1000-block backward scan. Building contiguously keeps the
+            // insert/remove pairing self-consistent, exactly as a single-finality node does.
+            let use_cache = outputs[i].head.saturating_sub(outputs[i].cursor) <= BACKFILL_GAP;
+            advance(
+                &mut builder,
+                &mut outputs[i],
+                &mut db,
+                &mut log_file,
+                keep_until,
+                use_cache,
+            )
+            .await;
+        }
+
+        if tick % STATS_EVERY_N_TICKS == 0 {
+            let cursors = outputs
                 .iter()
-                .map(|h| h.receipt_id.to_string())
+                .filter(|o| o.enabled)
+                .map(|o| {
+                    format!(
+                        "{}=cursor {} head {} ({} left, head {}s old)",
+                        o.config.name,
+                        o.cursor,
+                        o.head,
+                        remaining_work(o)
+                            .map(|w| w.to_string())
+                            .unwrap_or_else(|| "-".to_string()),
+                        head_age_secs(o)
+                    )
+                })
                 .collect::<Vec<_>>()
-                .join(", ");
-            tracing::log::warn!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{}]", block_height, hashes_str);
-            if redis_block < block_height {
-                if receipts_with_missing_tx_hashes
-                    .iter()
-                    .any(|r| !missing_receipts_whitelist.contains(&r.receipt_id))
-                {
-                    tracing::log::error!(target: PROJECT_ID, "Block {} is missing some tx hashes for receipts: [{:?}]", block_height, receipts_with_missing_tx_hashes);
-                    panic!(
-                        "Block {} is missing some tx hashes for receipts: [{}]",
-                        block_height, hashes_str
-                    );
-                }
+                .join("  ");
+            tracing::log::info!(target: PROJECT_ID, "{}  cache {} blocks / {} bytes", cursors, builder.cache.len(), builder.cache.bytes());
+        }
+    }
+}
+
+/// Walks one output from its cursor up to the head it saw at the start of this tick.
+///
+/// The cursor only moves past a height that actually produced a block. Empty heights are still
+/// stepped over within the sweep, but if the tail of the range is empty the cursor stays put and
+/// those heights are re-read next tick. That matters at the tip: `fetch_latest_block` can return a
+/// head whose height index is not readable yet, and retiring that height permanently would leave a
+/// hole that trips the skipped-block assert on the very next block.
+async fn advance(
+    builder: &mut Builder,
+    output: &mut Output,
+    db: &mut RedisDB,
+    log_file: &mut File,
+    keep_until: BlockHeight,
+    use_cache: bool,
+) {
+    let mut block_height = output.cursor;
+    while block_height <= output.head {
+        if let Some((_block_hash, bytes)) =
+            builder.get_or_build(block_height, keep_until, use_cache).await
+        {
+            emit_block(output, db, log_file, &bytes).await;
+            output.cursor = block_height + 1;
+        }
+        block_height += 1;
+    }
+}
+
+async fn emit_block(output: &mut Output, db: &mut RedisDB, log_file: &mut File, bytes: &[u8]) {
+    // Bridges the two copies of `near_primitives` in the dependency graph (2.13.4 from the git
+    // fork vs 0.37.4 from crates.io). Each output needs its own instance because
+    // `BlockWithTxHashes` is not `Clone` and `process_block` mutates it in place.
+    let fastnear_streamer_message: fastnear_primitives::near_indexer_primitives::StreamerMessage =
+        serde_json::from_slice(bytes).unwrap();
+    let mut block: BlockWithTxHashes = fastnear_streamer_message.into();
+    let block_height = block.block.header.height;
+    let prev_block_height = block.block.header.prev_height;
+    if let Some(prev_block_height) = prev_block_height {
+        assert!(
+            output.expected_block_height > prev_block_height,
+            "[{}] The indexer skipped a block. Expected block height: {}, but got: {}",
+            output.config.name,
+            output.expected_block_height,
+            prev_block_height
+        );
+    }
+    output.expected_block_height = block_height + 1;
+    let prev_block_hash = block.block.header.prev_hash;
+    if let Some(last_block_hash) = output.last_block_hash {
+        if last_block_hash != prev_block_hash {
+            let message = format!(
+                "[{}] Block hashes don't match at block height: {}. Last block height {:?}, prev block height {:?}. Expected: {}, got: {}",
+                output.config.name,
+                block_height,
+                output.last_block_height,
+                prev_block_height,
+                last_block_hash,
+                prev_block_hash
+            );
+            if output.config.strict_hash_check {
+                tracing::log::error!(target: PROJECT_ID, "{}", message);
+                panic!("{}", message);
+            } else {
+                tracing::log::warn!(target: PROJECT_ID, "{}", message);
             }
         }
+    }
+    output.last_block_hash = Some(block.block.header.hash);
+    let block_timestamp = block.block.header.timestamp;
+    let current_time_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let time_diff_ns = current_time_ns.saturating_sub(block_timestamp);
+    tracing::log::info!(target: PROJECT_ID, "[{}] Processing block {}\tlatency {:.3} sec", output.config.name, block_height, time_diff_ns as f64 / 1e9f64);
+    let receipts_with_missing_tx_hashes =
+        process_block(&mut output.tx_cache, &mut block, output.last_block_height);
+    output.last_block_height = Some(block_height);
 
-        if !config.stream_to_redis || redis_block >= block_height {
-            continue;
+    // nearcore's `build_streamer_message` has a `ProtocolFeature::Spice` early return that yields
+    // a block with every shard's `chunk: None` and no outcomes at all (streamer/mod.rs, marked
+    // "TODO(spice): Add indexer support for spice"). That block is structurally valid, so it would
+    // stream to Redis as a chain with no transactions and nothing to distinguish it from a quiet
+    // block. Spice is protocol version 180 and stable is 86, so this cannot fire today - it arms
+    // the day we rebase onto a nearcore that stabilizes it. Halt rather than poison the streams.
+    // The node tracks all shards (asserted by `IndexerConfig::load_near_config`), so any included
+    // chunk is fetched, and `chunks_included > 0` with no chunks at all is otherwise impossible.
+    if block.block.header.chunks_included > 0 && block.shards.iter().all(|s| s.chunk.is_none()) {
+        panic!(
+            "[{}] Block {} reports {} included chunks but carries none. \
+             This is what nearcore emits once ProtocolFeature::Spice is active; the indexer does \
+             not support it yet and would stream empty blocks. Refusing to write.",
+            output.config.name, block_height, block.block.header.chunks_included
+        );
+    }
+
+    let past_watermark = output.redis_watermark < block_height;
+
+    if !receipts_with_missing_tx_hashes.is_empty() {
+        let hashes_str = receipts_with_missing_tx_hashes
+            .iter()
+            .map(|h| h.receipt_id.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        tracing::log::warn!(target: PROJECT_ID, "[{}] Block {} is missing some tx hashes for receipts: [{}]", output.config.name, block_height, hashes_str);
+        if past_watermark
+            && receipts_with_missing_tx_hashes
+                .iter()
+                .any(|r| !output.config.missing_receipts_whitelist.contains(&r.receipt_id))
+        {
+            tracing::log::error!(target: PROJECT_ID, "[{}] Block {} is missing some tx hashes for receipts: [{:?}]", output.config.name, block_height, receipts_with_missing_tx_hashes);
+            if output.config.fatal_on_missing_tx_hashes {
+                panic!(
+                    "[{}] Block {} is missing some tx hashes for receipts: [{}]",
+                    output.config.name, block_height, hashes_str
+                );
+            }
+            // `tx_hash: None` is a representable value and the whitelist already emits blocks
+            // carrying it, so degrade rather than take the final stream down with us.
         }
+    }
 
-        let serialized_block = serde_json::to_string(&block).unwrap();
-        let block_size = serialized_block.len();
-        let block_local_hash = hash(serialized_block.as_bytes());
-        let block_hash = block.block.header.hash;
+    if !past_watermark || (!output.config.stream_to_redis && !output.config.log_blocks) {
+        return;
+    }
+
+    let serialized_block = serde_json::to_string(&block).unwrap();
+    let block_size = serialized_block.len();
+    let block_local_hash = hash(serialized_block.as_bytes());
+    let block_hash = block.block.header.hash;
+    if output.config.log_blocks {
         writeln!(
-            config.log_file,
+            log_file,
             "{:?},{},{},{},{}",
-            config.finality, block_height, block_hash, block_local_hash, block_size
+            output.config.finality, block_height, block_hash, block_local_hash, block_size
         )
         .expect("Failed to write to log file");
+    }
 
-        let data = vec![(BLOCK_KEY.to_string(), serialized_block)];
+    if !output.config.stream_to_redis {
+        return;
+    }
 
-        let id = format!("{}-0", block_height);
+    let data = vec![(BLOCK_KEY.to_string(), serialized_block)];
 
-        let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
-        for iter in 0..=MAX_RETRIES {
-            if iter == MAX_RETRIES {
-                panic!("Failed to write to redis. Don't want to skip the block");
+    let id = format!("{}-0", block_height);
+
+    let mut delay = tokio::time::Duration::from_millis(INITIAL_RETRY_DELAY);
+    for iter in 0..=MAX_RETRIES {
+        if iter == MAX_RETRIES {
+            let message = format!(
+                "[{}] Failed to write block {} to redis after {} attempts",
+                output.config.name, block_height, MAX_RETRIES
+            );
+            if output.config.fatal_on_redis_failure {
+                panic!("{}. Don't want to skip the block", message);
             }
-            let result = db
-                .xadd(&config.blocks_key, &id, &data, config.max_num_blocks)
-                .await;
-            match result {
-                Ok(res) => {
-                    tracing::log::info!(target: PROJECT_ID, "Added {}", res);
+            // The optimistic stream tolerates gaps by construction, so don't take the final
+            // stream down with it.
+            tracing::log::error!(target: PROJECT_ID, "{}. Skipping the block", message);
+            break;
+        }
+        let result = db
+            .xadd(
+                &output.config.blocks_key,
+                &id,
+                &data,
+                output.config.max_num_blocks,
+            )
+            .await;
+        match result {
+            Ok(res) => {
+                tracing::log::info!(target: PROJECT_ID, "[{}] Added {}", output.config.name, res);
+                break;
+            }
+            Err(err) => {
+                if err.kind() == redis::ErrorKind::ResponseError &&
+                    err.to_string().contains("The ID specified in XADD is equal or smaller than the target stream top item") {
+                    tracing::log::warn!(target: PROJECT_ID, "[{}] Duplicate ID {}: {}", output.config.name, id, err);
                     break;
-                }
-                Err(err) => {
-                    if err.kind() == redis::ErrorKind::ResponseError &&
-                        err.to_string().contains("The ID specified in XADD is equal or smaller than the target stream top item") {
-                        tracing::log::warn!(target: PROJECT_ID, "Duplicate ID {}: {}", id, err);
-                        break;
-                    } else {
-                        tracing::log::error!(target: PROJECT_ID, "Error: {}", err);
-                        tokio::time::sleep(delay).await;
-                        let _ = db.reconnect().await;
-                        delay *= 2;
-                        continue;
-                    }
+                } else {
+                    tracing::log::error!(target: PROJECT_ID, "[{}] Error: {}", output.config.name, err);
+                    tokio::time::sleep(delay).await;
+                    let _ = db.reconnect().await;
+                    delay *= 2;
+                    continue;
                 }
             }
         }
@@ -394,4 +1121,189 @@ fn process_block(
     }
 
     receipts_with_missing_tx_hashes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn block_hash(n: u8) -> BlockHash {
+        BlockHash::hash_bytes(&[n])
+    }
+
+    fn bytes(len: usize) -> Arc<Vec<u8>> {
+        Arc::new(vec![0u8; len])
+    }
+
+    fn output(name: &'static str, finality: Finality, cursor: BlockHeight, head: BlockHeight) -> Output {
+        let mut o = Output::new(
+            OutputConfig {
+                name,
+                blocks_key: name.to_string(),
+                finality,
+                max_num_blocks: None,
+                stream_to_redis: false,
+                log_blocks: false,
+                strict_hash_check: true,
+                fatal_on_redis_failure: true,
+                fatal_on_missing_tx_hashes: true,
+                receipt_backfill_depth: RECEIPT_BACKFILL_DEPTH,
+                missing_receipts_whitelist: Arc::new(HashSet::new()),
+            },
+            cursor,
+            0,
+        );
+        o.head = head;
+        o
+    }
+
+    #[test]
+    fn cache_admits_within_the_window_only() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.admit(1064, block_hash(2), &bytes(10), 1000);
+        // One past the window.
+        cache.admit(1065, block_hash(3), &bytes(10), 1000);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&block_hash(3)).is_none());
+        assert_eq!(cache.bytes(), 20);
+    }
+
+    #[test]
+    fn cache_is_inert_with_a_zero_window() {
+        let mut cache = BlockCache::new(0, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn cache_stops_admitting_at_the_byte_backstop() {
+        let mut cache = BlockCache::new(64, 100);
+        cache.admit(1000, block_hash(1), &bytes(99), 1000);
+        assert_eq!(cache.len(), 1);
+        // Already at/over the cap, so nothing more is taken.
+        cache.admit(1001, block_hash(2), &bytes(10), 1000);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 99);
+    }
+
+    #[test]
+    fn prune_keeps_the_boundary_height() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.admit(1001, block_hash(2), &bytes(10), 1000);
+        cache.admit(1002, block_hash(3), &bytes(10), 1000);
+        cache.prune_below(1001);
+        assert!(cache.get(&block_hash(1)).is_none());
+        assert!(cache.get(&block_hash(2)).is_some());
+        assert!(cache.get(&block_hash(3)).is_some());
+        assert_eq!(cache.bytes(), 20);
+    }
+
+    /// A reorg leaves two hashes at one height. Both must be reachable while the height is live,
+    /// and both must go when it is pruned - a one-to-one height index would leak the orphan.
+    #[test]
+    fn reorged_height_keeps_both_blocks_and_leaks_neither() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        let orphan = block_hash(1);
+        let canonical = block_hash(2);
+        cache.admit(1000, orphan, &bytes(10), 1000);
+        cache.admit(1000, canonical, &bytes(10), 1000);
+        assert_eq!(cache.len(), 2);
+        assert!(cache.get(&orphan).is_some());
+        assert!(cache.get(&canonical).is_some());
+
+        cache.prune_below(1001);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn admitting_the_same_block_twice_does_not_double_count() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), 10);
+        cache.prune_below(1001);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    #[test]
+    fn closing_the_window_drops_everything() {
+        let mut cache = BlockCache::new(64, usize::MAX);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        cache.set_window(0);
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+        cache.admit(1000, block_hash(1), &bytes(10), 1000);
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// Regression, both directions. The cursor sits one past the last block emitted, so being
+    /// level with the head means `cursor == head + 1`. Measuring against `head` reported that
+    /// normal steady state as underflow; measuring with saturating arithmetic reported a node
+    /// that had not reached our cursor as zero work. Both mis-read the gate.
+    #[test]
+    fn remaining_work_separates_caught_up_from_behind() {
+        let mut primary = output("final", Finality::Final, 1000, 1000);
+
+        // Level with the head: nothing left to do.
+        primary.head = 999;
+        assert_eq!(remaining_work(&primary), Some(0));
+        assert!(should_activate_optimistic(remaining_work(&primary), 0, 200));
+
+        // One block to sweep.
+        primary.head = 1000;
+        assert_eq!(remaining_work(&primary), Some(1));
+
+        // Node has not reached what we already streamed: catching up, not caught up.
+        primary.head = 800;
+        assert_eq!(remaining_work(&primary), None);
+        assert!(!should_activate_optimistic(remaining_work(&primary), 0, 200));
+        assert!(optimistic_is_crowding_primary(remaining_work(&primary), 200));
+    }
+
+    /// A stale head means the node is still syncing, however little the cursor has left to do.
+    #[test]
+    fn a_stale_head_blocks_activation() {
+        let work = Some(0);
+        assert!(should_activate_optimistic(work, 5, 200));
+        assert!(!should_activate_optimistic(
+            work,
+            OPTIMISTIC_ENABLE_MAX_HEAD_AGE_SECS + 1,
+            200
+        ));
+    }
+
+    #[test]
+    fn optimistic_gate_has_hysteresis() {
+        let threshold = 200;
+        // Between the enable and shed thresholds: neither starts nor counts towards stopping.
+        assert!(!should_activate_optimistic(Some(500), 0, threshold));
+        assert!(!optimistic_is_crowding_primary(Some(500), threshold));
+        // Past the shed threshold (4x).
+        assert!(optimistic_is_crowding_primary(Some(801), threshold));
+        // At the enable threshold exactly.
+        assert!(should_activate_optimistic(Some(200), 0, threshold));
+        assert!(!should_activate_optimistic(Some(201), 0, threshold));
+    }
+
+    #[test]
+    fn live_outputs_sweep_before_backfilling_ones() {
+        // Steady state: both caught up, so the latency-sensitive optimistic stream leads.
+        let outputs = vec![
+            output("final", Finality::Final, 1000, 1000),
+            output("optimistic", Finality::None, 1002, 1002),
+        ];
+        assert_eq!(priority_order(&outputs), vec![1, 0]);
+
+        // Just activated: the optimistic backfill must not sit in front of a live final block.
+        let outputs = vec![
+            output("final", Finality::Final, 1000, 1001),
+            output("optimistic", Finality::None, 740, 1001),
+        ];
+        assert_eq!(priority_order(&outputs), vec![0, 1]);
+    }
 }
