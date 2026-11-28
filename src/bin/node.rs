@@ -25,6 +25,14 @@
 //!   BLOCK_CACHE_WINDOW            blocks kept for the second output to reuse (default 64,
 //!                                 0 disables the cache)
 //!   BLOCK_CACHE_MAX_BYTES         cache backstop (default 256 MiB)
+//!
+//!   INDEXER_HEALTH_PORT           port serving `GET /indexer-health` (default 3040). Returns 200
+//!                                 while every configured stream's last processed block is younger
+//!                                 than its limit below, 503 otherwise
+//!   INDEXER_HEALTH_MAX_OPTIMISTIC_LATENCY_SEC
+//!                                 limit for a stream following the chain head (default 5)
+//!   INDEXER_HEALTH_MAX_FINAL_LATENCY_SEC
+//!                                 limit for a final / near-final stream (default 15)
 
 use std::io::Write;
 mod common;
@@ -42,6 +50,7 @@ use redis_db::RedisDB;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs::{create_dir_all, File, OpenOptions};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -102,6 +111,12 @@ const OPTIMISTIC_COOLDOWN_TICKS: u64 = 600;
 
 /// How often (in sweep ticks) to log cursor/cache stats.
 const STATS_EVERY_N_TICKS: u64 = 200;
+
+const DEFAULT_INDEXER_HEALTH_PORT: u16 = 3040;
+
+/// How old the last processed block may be for `/indexer-health` to report a stream as healthy.
+const DEFAULT_INDEXER_HEALTH_MAX_OPTIMISTIC_LATENCY_SEC: f64 = 5.0;
+const DEFAULT_INDEXER_HEALTH_MAX_FINAL_LATENCY_SEC: f64 = 15.0;
 
 #[derive(Default)]
 pub struct TxCache {
@@ -404,9 +419,22 @@ pub struct OutputConfig {
     pub missing_receipts_whitelist: Arc<HashSet<CryptoHash>>,
 }
 
+/// The last block an output processed, shared with the `/indexer-health` server thread.
+///
+/// Holds the block's own timestamp rather than the latency logged for it: the endpoint derives the
+/// latency from the clock at request time, so a stalled sweep reads as growing latency instead of
+/// freezing at the last good value.
+#[derive(Default)]
+pub struct StreamHealth {
+    /// Header timestamp (unix nanos) of the last processed block. 0 until the first block.
+    pub last_block_timestamp_ns: AtomicU64,
+    pub last_block_height: AtomicU64,
+}
+
 /// Mutable per-output state.
 pub struct Output {
     pub config: OutputConfig,
+    pub health: Arc<StreamHealth>,
     /// Never shared between outputs: an optimistic cache legitimately holds receipts from abandoned
     /// fork blocks, which would trip `store_receipt_to_tx`'s assert in another output.
     pub tx_cache: TxCache,
@@ -433,6 +461,7 @@ impl Output {
     pub fn new(config: OutputConfig, cursor: BlockHeight, redis_watermark: BlockHeight) -> Self {
         Self {
             config,
+            health: Arc::default(),
             tx_cache: TxCache::default(),
             cursor,
             redis_watermark,
@@ -515,6 +544,20 @@ fn main() {
         .map(|s| s.parse().unwrap())
         .unwrap_or(DEFAULT_BLOCK_CACHE_MAX_BYTES);
 
+    let indexer_health_port: u16 = env::var("INDEXER_HEALTH_PORT")
+        .map(|s| s.parse().unwrap())
+        .unwrap_or(DEFAULT_INDEXER_HEALTH_PORT);
+    let max_optimistic_latency = Duration::from_secs_f64(
+        env::var("INDEXER_HEALTH_MAX_OPTIMISTIC_LATENCY_SEC")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(DEFAULT_INDEXER_HEALTH_MAX_OPTIMISTIC_LATENCY_SEC),
+    );
+    let max_final_latency = Duration::from_secs_f64(
+        env::var("INDEXER_HEALTH_MAX_FINAL_LATENCY_SEC")
+            .map(|s| s.parse().unwrap())
+            .unwrap_or(DEFAULT_INDEXER_HEALTH_MAX_FINAL_LATENCY_SEC),
+    );
+
     // `RedisDB::new` hands the whole string to `Client::open`; only `caching-saver` splits on `,`.
     let redis_url = env::var("REDIS_URL").expect("Missing REDIS_URL env var");
     assert!(
@@ -580,25 +623,11 @@ fn main() {
                 tracing::log::info!(target: PROJECT_ID, "Redis at block height: {:?}", last_redis_block_height);
                 tracing::log::info!(target: PROJECT_ID, "Starting sweep at block height: {}", expected_block_height);
 
-                let indexer_config = near_indexer::IndexerConfig {
-                    home_dir,
-                    // `sync_mode`, `finality` and `interval` only feed `streamer::start`, which we
-                    // never call. Sweeping is driven by `Builder`/`Output` below.
-                    sync_mode: near_indexer::SyncModeEnum::BlockHeight(expected_block_height),
-                    await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
-                    validate_genesis: false,
-                    interval: sweep_interval,
-                    finality: finality.clone(),
-                    skip_broken_blocks: false,
-                };
-
-                let indexer = near_indexer::Indexer::new(indexer_config).await.expect("Failed to create indexer");
-
                 let mut outputs = vec![Output::new(
                     OutputConfig {
                         name: "final",
                         blocks_key,
-                        finality,
+                        finality: finality.clone(),
                         max_num_blocks,
                         stream_to_redis,
                         log_blocks,
@@ -639,6 +668,44 @@ fn main() {
                     outputs.push(optimistic);
                 }
 
+                // Bound before neard boots, so a port conflict fails in milliseconds rather than
+                // after the node has opened its database.
+                let health_checks = outputs
+                    .iter()
+                    .map(|output| HealthCheck {
+                        name: output.config.name,
+                        // By finality, not by name: a single-stream `FINALITY="optimistic"` node
+                        // still labels its only output "final".
+                        max_latency: if output.config.finality == Finality::None {
+                            max_optimistic_latency
+                        } else {
+                            max_final_latency
+                        },
+                        health: Arc::clone(&output.health),
+                    })
+                    .collect();
+                let health_server = start_health_server(indexer_health_port, health_checks);
+                actix::spawn(async move {
+                    if let Err(err) = health_server.await {
+                        tracing::log::error!(target: PROJECT_ID, "Indexer health server stopped: {}", err);
+                    }
+                });
+                tracing::log::info!(target: PROJECT_ID, "Serving indexer health on 0.0.0.0:{}/indexer-health", indexer_health_port);
+
+                let indexer_config = near_indexer::IndexerConfig {
+                    home_dir,
+                    // `sync_mode`, `finality` and `interval` only feed `streamer::start`, which we
+                    // never call. Sweeping is driven by `Builder`/`Output` below.
+                    sync_mode: near_indexer::SyncModeEnum::BlockHeight(expected_block_height),
+                    await_for_node_synced: near_indexer::AwaitForNodeSyncedEnum::StreamWhileSyncing,
+                    validate_genesis: false,
+                    interval: sweep_interval,
+                    finality,
+                    skip_broken_blocks: false,
+                };
+
+                let indexer = near_indexer::Indexer::new(indexer_config).await.expect("Failed to create indexer");
+
                 // `run` turns the window on only once two outputs are actually sweeping.
                 let block_cache_window = if outputs.len() > 1 { block_cache_window } else { 0 };
                 let builder = Builder::new(indexer, BlockCache::new(0, block_cache_max_bytes));
@@ -660,6 +727,73 @@ fn main() {
         }
         _ => panic!("You have to pass `run` arg"),
     }
+}
+
+/// One stream as `/indexer-health` judges it.
+struct HealthCheck {
+    name: &'static str,
+    max_latency: Duration,
+    health: Arc<StreamHealth>,
+}
+
+/// Whether a stream's last processed block is recent enough. A stream that has not processed a
+/// block yet is unhealthy, which also covers an optimistic output that is held off or shed.
+fn stream_is_healthy(now_ns: u64, last_block_timestamp_ns: u64, max_latency: Duration) -> bool {
+    last_block_timestamp_ns != 0
+        && Duration::from_nanos(now_ns.saturating_sub(last_block_timestamp_ns)) < max_latency
+}
+
+async fn indexer_health(checks: actix_web::web::Data<Vec<HealthCheck>>) -> actix_web::HttpResponse {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos() as u64;
+    let mut all_healthy = true;
+    let streams: Vec<_> = checks
+        .iter()
+        .map(|check| {
+            let timestamp_ns = check.health.last_block_timestamp_ns.load(Ordering::Relaxed);
+            let block_height = check.health.last_block_height.load(Ordering::Relaxed);
+            let healthy = stream_is_healthy(now_ns, timestamp_ns, check.max_latency);
+            all_healthy &= healthy;
+            let seen = timestamp_ns != 0;
+            serde_json::json!({
+                "name": check.name,
+                "healthy": healthy,
+                "block_height": seen.then_some(block_height),
+                "latency_sec": seen.then(|| now_ns.saturating_sub(timestamp_ns) as f64 / 1e9f64),
+                "max_latency_sec": check.max_latency.as_secs_f64(),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({ "healthy": all_healthy, "streams": streams });
+    if all_healthy {
+        actix_web::HttpResponse::Ok().json(body)
+    } else {
+        actix_web::HttpResponse::ServiceUnavailable().json(body)
+    }
+}
+
+/// Binds the health endpoint and returns the server future, which the caller must spawn.
+///
+/// Requests are answered on the server's own worker thread, so the endpoint keeps responding while
+/// the sweep task is busy or stuck - which is exactly when it has to report 503.
+fn start_health_server(port: u16, checks: Vec<HealthCheck>) -> actix_web::dev::Server {
+    let checks = actix_web::web::Data::new(checks);
+    actix_web::HttpServer::new(move || {
+        actix_web::App::new()
+            .app_data(checks.clone())
+            .route("/indexer-health", actix_web::web::get().to(indexer_health))
+            // Some uptime checkers probe with HEAD; without this they would get a 404.
+            .route("/indexer-health", actix_web::web::head().to(indexer_health))
+    })
+    .workers(1)
+    // Nothing else in this process handles signals, so SIGTERM/SIGINT kill it outright. Left
+    // enabled, actix-web would catch them and shut down only this server, leaving the node running.
+    .disable_signals()
+    .bind(("0.0.0.0", port))
+    .unwrap_or_else(|err| panic!("Failed to bind indexer health to port {}: {}", port, err))
+    .run()
 }
 
 /// Blocks still to sweep before this output is level with its head.
@@ -962,6 +1096,14 @@ async fn emit_block(output: &mut Output, db: &mut RedisDB, log_file: &mut File, 
         .as_nanos() as u64;
     let time_diff_ns = current_time_ns.saturating_sub(block_timestamp);
     tracing::log::info!(target: PROJECT_ID, "[{}] Processing block {}\tlatency {:.3} sec", output.config.name, block_height, time_diff_ns as f64 / 1e9f64);
+    output
+        .health
+        .last_block_timestamp_ns
+        .store(block_timestamp, Ordering::Relaxed);
+    output
+        .health
+        .last_block_height
+        .store(block_height, Ordering::Relaxed);
     let receipts_with_missing_tx_hashes =
         process_block(&mut output.tx_cache, &mut block, output.last_block_height);
     output.last_block_height = Some(block_height);
@@ -1166,6 +1308,127 @@ mod tests {
         );
         o.head = head;
         o
+    }
+
+    #[test]
+    fn stream_health_follows_the_age_of_the_last_block() {
+        const SEC: u64 = 1_000_000_000;
+        let now = 1_000 * SEC;
+        let limit = Duration::from_secs(5);
+
+        // Nothing processed yet: warm-up, or an optimistic output that is held off or shed.
+        assert!(!stream_is_healthy(now, 0, limit));
+
+        assert!(stream_is_healthy(now, now - SEC, limit));
+        assert!(stream_is_healthy(now, now - 5 * SEC + 1, limit));
+        // The limit itself is already too old: healthy means strictly below it.
+        assert!(!stream_is_healthy(now, now - 5 * SEC, limit));
+        assert!(!stream_is_healthy(now, now - 60 * SEC, limit));
+
+        // A block stamped ahead of the local clock reads as zero latency, as in the log line.
+        assert!(stream_is_healthy(now, now + SEC, limit));
+    }
+
+    #[actix_web::test]
+    async fn indexer_health_endpoint_turns_503_when_any_stream_is_stale() {
+        fn now_ns() -> u64 {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos() as u64
+        }
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let final_health = Arc::new(StreamHealth::default());
+        let optimistic_health = Arc::new(StreamHealth::default());
+        let server = start_health_server(
+            port,
+            vec![
+                HealthCheck {
+                    name: "final",
+                    max_latency: Duration::from_secs(15),
+                    health: Arc::clone(&final_health),
+                },
+                HealthCheck {
+                    name: "optimistic",
+                    max_latency: Duration::from_secs(5),
+                    health: Arc::clone(&optimistic_health),
+                },
+            ],
+        );
+        let handle = server.handle();
+        actix::spawn(async move {
+            let _ = server.await;
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let url = format!("http://127.0.0.1:{}/indexer-health", port);
+
+        // Nothing processed yet.
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), 503);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["healthy"], false);
+        assert!(body["streams"][0]["block_height"].is_null());
+
+        // Only the final stream is live: the optimistic one is still held off.
+        final_health
+            .last_block_timestamp_ns
+            .store(now_ns(), Ordering::Relaxed);
+        final_health.last_block_height.store(42, Ordering::Relaxed);
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 503);
+
+        optimistic_health
+            .last_block_timestamp_ns
+            .store(now_ns(), Ordering::Relaxed);
+        optimistic_health
+            .last_block_height
+            .store(44, Ordering::Relaxed);
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), 200);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["healthy"], true);
+        assert_eq!(body["streams"][0]["name"], "final");
+        assert_eq!(body["streams"][0]["block_height"], 42);
+        assert_eq!(body["streams"][1]["block_height"], 44);
+        assert_eq!(client.head(&url).send().await.unwrap().status(), 200);
+
+        // The sweep shares this thread's runtime, so block it outright and probe from another
+        // thread: the endpoint must still answer, or a stuck sweep would time probes out instead
+        // of reporting 503.
+        let probe = std::thread::spawn(move || {
+            use std::io::Read;
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .write_all(b"GET /indexer-health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            response
+        });
+        assert!(probe.join().unwrap().starts_with("HTTP/1.1 200"));
+
+        // 10s old is fine for final but past the optimistic limit.
+        let ten_secs_ago = now_ns() - 10_000_000_000;
+        final_health
+            .last_block_timestamp_ns
+            .store(ten_secs_ago, Ordering::Relaxed);
+        assert_eq!(client.get(&url).send().await.unwrap().status(), 200);
+        optimistic_health
+            .last_block_timestamp_ns
+            .store(ten_secs_ago, Ordering::Relaxed);
+        let response = client.get(&url).send().await.unwrap();
+        assert_eq!(response.status(), 503);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["streams"][0]["healthy"], true);
+        assert_eq!(body["streams"][1]["healthy"], false);
+
+        handle.stop(false).await;
     }
 
     #[test]
